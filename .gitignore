@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+env_*/
+venv/
+.env
+
+# Editors
+.vscode/
+.idea/
+
+# Data / models / logs
+logs/
+*.ckpt
+*.pth
+*.pt
+unitree_model/
+*.usd
+*.usda
+*.usdc
+
+# System
+.DS_Store
