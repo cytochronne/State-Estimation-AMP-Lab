@@ -17,14 +17,12 @@ Please keep the lists sorted alphabetically.
 
 ---
 
-* Clemens Schwarke
 * Mayank Mittal
+* Clemens Schwarke
 
 ## Authors
 
-* Clemens Schwarke
 * David Hoeller
-* Mayank Mittal
 * Nikita Rudin
 
 ## Contributors

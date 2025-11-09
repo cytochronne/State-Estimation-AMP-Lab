@@ -14,6 +14,12 @@ class BasePPORunnerCfg(RslRlOnPolicyRunnerCfg):
     save_interval = 100
     experiment_name = ""  # same as task name
     empirical_normalization = False
+    obs_groups = {
+        "policy": ["policy"],
+        # optional: you may explicitly set critic; if omitted, resolve_obs_groups() will fill it
+        # "critic": ["critic"],
+    }
+
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
         actor_hidden_dims=[512, 256, 128],

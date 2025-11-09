@@ -3,16 +3,8 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Definitions for components of modules."""
+"""Definitions for neural networks."""
 
-from .memory import HiddenState, Memory
-from .mlp import MLP
-from .normalization import EmpiricalDiscountedVariationNormalization, EmpiricalNormalization
+from .memory import Memory
 
-__all__ = [
-    "MLP",
-    "EmpiricalDiscountedVariationNormalization",
-    "EmpiricalNormalization",
-    "HiddenState",
-    "Memory",
-]
+__all__ = ["Memory"]

@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Implementation of different learning algorithms."""
+"""Implementation of different RL agents."""
 
 from .distillation import Distillation
 from .ppo import PPO

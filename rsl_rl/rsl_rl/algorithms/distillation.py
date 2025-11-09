@@ -3,13 +3,14 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+# torch
 import torch
 import torch.nn as nn
-from tensordict import TensorDict
+import torch.optim as optim
 
+# rsl-rl
 from rsl_rl.modules import StudentTeacher, StudentTeacherRecurrent
 from rsl_rl.storage import RolloutStorage
-from rsl_rl.utils import resolve_optimizer
 
 
 class Distillation:
@@ -20,21 +21,19 @@ class Distillation:
 
     def __init__(
         self,
-        policy: StudentTeacher | StudentTeacherRecurrent,
-        num_learning_epochs: int = 1,
-        gradient_length: int = 15,
-        learning_rate: float = 1e-3,
-        max_grad_norm: float | None = None,
-        loss_type: str = "mse",
-        optimizer: str = "adam",
-        device: str = "cpu",
+        policy,
+        num_learning_epochs=1,
+        gradient_length=15,
+        learning_rate=1e-3,
+        max_grad_norm=None,
+        loss_type="mse",
+        device="cpu",
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
-    ) -> None:
-        # Device-related parameters
+    ):
+        # device-related parameters
         self.device = device
         self.is_multi_gpu = multi_gpu_cfg is not None
-
         # Multi-GPU parameters
         if multi_gpu_cfg is not None:
             self.gpu_global_rank = multi_gpu_cfg["global_rank"]
@@ -43,77 +42,66 @@ class Distillation:
             self.gpu_global_rank = 0
             self.gpu_world_size = 1
 
-        # Distillation components
+        self.rnd = None  # TODO: remove when runner has a proper base class
+
+        # distillation components
         self.policy = policy
         self.policy.to(self.device)
-        self.storage = None  # Initialized later
-
-        # Initialize the optimizer
-        self.optimizer = resolve_optimizer(optimizer)(self.policy.parameters(), lr=learning_rate)
-
-        # Initialize the transition
+        self.storage = None  # initialized later
+        self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
         self.transition = RolloutStorage.Transition()
-        self.last_hidden_states = (None, None)
+        self.last_hidden_states = None
 
-        # Distillation parameters
+        # distillation parameters
         self.num_learning_epochs = num_learning_epochs
         self.gradient_length = gradient_length
         self.learning_rate = learning_rate
         self.max_grad_norm = max_grad_norm
 
-        # Initialize the loss function
-        loss_fn_dict = {
-            "mse": nn.functional.mse_loss,
-            "huber": nn.functional.huber_loss,
-        }
-        if loss_type in loss_fn_dict:
-            self.loss_fn = loss_fn_dict[loss_type]
+        # initialize the loss function
+        if loss_type == "mse":
+            self.loss_fn = nn.functional.mse_loss
+        elif loss_type == "huber":
+            self.loss_fn = nn.functional.huber_loss
         else:
-            raise ValueError(f"Unknown loss type: {loss_type}. Supported types are: {list(loss_fn_dict.keys())}")
+            raise ValueError(f"Unknown loss type: {loss_type}. Supported types are: mse, huber")
 
         self.num_updates = 0
 
     def init_storage(
-        self,
-        training_type: str,
-        num_envs: int,
-        num_transitions_per_env: int,
-        obs: TensorDict,
-        actions_shape: tuple[int],
-    ) -> None:
-        # Create rollout storage
+        self, training_type, num_envs, num_transitions_per_env, student_obs_shape, teacher_obs_shape, actions_shape
+    ):
+        # create rollout storage
         self.storage = RolloutStorage(
             training_type,
             num_envs,
             num_transitions_per_env,
-            obs,
+            student_obs_shape,
+            teacher_obs_shape,
             actions_shape,
+            None,
             self.device,
         )
 
-    def act(self, obs: TensorDict) -> torch.Tensor:
-        # Compute the actions
+    def act(self, obs, teacher_obs):
+        # compute the actions
         self.transition.actions = self.policy.act(obs).detach()
-        self.transition.privileged_actions = self.policy.evaluate(obs).detach()
-        # Record the observations
+        self.transition.privileged_actions = self.policy.evaluate(teacher_obs).detach()
+        # record the observations
         self.transition.observations = obs
+        self.transition.privileged_observations = teacher_obs
         return self.transition.actions
 
-    def process_env_step(
-        self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
-    ) -> None:
-        # Update the normalizers
-        self.policy.update_normalization(obs)
-
-        # Record the rewards and dones
+    def process_env_step(self, rewards, dones, infos):
+        # record the rewards and dones
         self.transition.rewards = rewards
         self.transition.dones = dones
-        # Record the transition
+        # record the transition
         self.storage.add_transitions(self.transition)
         self.transition.clear()
         self.policy.reset(dones)
 
-    def update(self) -> dict[str, float]:
+    def update(self):
         self.num_updates += 1
         mean_behavior_loss = 0
         loss = 0
@@ -122,19 +110,20 @@ class Distillation:
         for epoch in range(self.num_learning_epochs):
             self.policy.reset(hidden_states=self.last_hidden_states)
             self.policy.detach_hidden_states()
-            for obs, _, privileged_actions, dones in self.storage.generator():
-                # Inference of the student for gradient computation
+            for obs, _, _, privileged_actions, dones in self.storage.generator():
+
+                # inference the student for gradient computation
                 actions = self.policy.act_inference(obs)
 
-                # Behavior cloning loss
+                # behavior cloning loss
                 behavior_loss = self.loss_fn(actions, privileged_actions)
 
-                # Total loss
+                # total loss
                 loss = loss + behavior_loss
                 mean_behavior_loss += behavior_loss.item()
                 cnt += 1
 
-                # Gradient step
+                # gradient step
                 if cnt % self.gradient_length == 0:
                     self.optimizer.zero_grad()
                     loss.backward()
@@ -146,7 +135,7 @@ class Distillation:
                     self.policy.detach_hidden_states()
                     loss = 0
 
-                # Reset dones
+                # reset dones
                 self.policy.reset(dones.view(-1))
                 self.policy.detach_hidden_states(dones.view(-1))
 
@@ -155,21 +144,25 @@ class Distillation:
         self.last_hidden_states = self.policy.get_hidden_states()
         self.policy.detach_hidden_states()
 
-        # Construct the loss dictionary
+        # construct the loss dictionary
         loss_dict = {"behavior": mean_behavior_loss}
 
         return loss_dict
 
-    def broadcast_parameters(self) -> None:
+    """
+    Helper functions
+    """
+
+    def broadcast_parameters(self):
         """Broadcast model parameters to all GPUs."""
-        # Obtain the model parameters on current GPU
+        # obtain the model parameters on current GPU
         model_params = [self.policy.state_dict()]
-        # Broadcast the model parameters
+        # broadcast the model parameters
         torch.distributed.broadcast_object_list(model_params, src=0)
-        # Load the model parameters on all GPUs from source GPU
+        # load the model parameters on all GPUs from source GPU
         self.policy.load_state_dict(model_params[0])
 
-    def reduce_parameters(self) -> None:
+    def reduce_parameters(self):
         """Collect gradients from all GPUs and average them.
 
         This function is called after the backward pass to synchronize the gradients across all GPUs.
@@ -185,7 +178,7 @@ class Distillation:
         for param in self.policy.parameters():
             if param.grad is not None:
                 numel = param.numel()
-                # Copy data back from shared buffer
+                # copy data back from shared buffer
                 param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
-                # Update the offset for the next parameter
+                # update the offset for the next parameter
                 offset += numel
