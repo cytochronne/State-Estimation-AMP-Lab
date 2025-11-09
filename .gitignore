@@ -21,3 +21,5 @@ unitree_model/
 
 # System
 .DS_Store
+
+*.sh
