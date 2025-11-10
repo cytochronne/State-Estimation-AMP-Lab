@@ -8,6 +8,18 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 
 
 @configclass
+class TerrainAwarePpoActorCriticCfg(RslRlPpoActorCriticCfg):
+    class_name = "TerrainAwareRecurrentActorCritic"
+    height_obs_dim: int = 0
+    height_encoder_dims = (256, 128)
+    fusion_encoder_dims = (256, 256)
+    rnn_type = "lstm"
+    rnn_hidden_dim = 256
+    rnn_num_layers = 1
+    noise_std_type = "scalar"
+
+
+@configclass
 class BasePPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 24
     max_iterations = 50000
@@ -39,4 +51,15 @@ class BasePPORunnerCfg(RslRlOnPolicyRunnerCfg):
         lam=0.95,
         desired_kl=0.01,
         max_grad_norm=1.0,
+    )
+
+
+@configclass
+class TerrainAwarePPORunnerCfg(BasePPORunnerCfg):
+    policy = TerrainAwarePpoActorCriticCfg(
+        init_noise_std=1.0,
+        actor_hidden_dims=[512, 256, 128],
+        critic_hidden_dims=[512, 256, 128],
+        activation="elu",
+        height_obs_dim=187,
     )

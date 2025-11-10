@@ -20,6 +20,7 @@ from rsl_rl.modules import (
     EmpiricalNormalization,
     StudentTeacher,
     StudentTeacherRecurrent,
+    TerrainAwareRecurrentActorCritic,
 )
 from rsl_rl.utils import store_code_state
 

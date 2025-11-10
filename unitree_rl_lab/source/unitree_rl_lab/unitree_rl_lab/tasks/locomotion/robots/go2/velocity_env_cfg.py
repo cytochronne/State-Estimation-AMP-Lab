@@ -237,7 +237,7 @@ class ObservationsCfg:
         )
 
         def __post_init__(self):
-            # self.history_length = 5
+            self.history_length = 5
             self.enable_corruption = True
             self.concatenate_terms = True
     
@@ -263,8 +263,8 @@ class ObservationsCfg:
             clip=(-1.0, 5.0),
         )
 
-        # def __post_init__(self):
-        #     self.history_length = 5
+        def __post_init__(self):
+            self.history_length = 5
 
     # privileged observations
     critic: CriticCfg = CriticCfg()
