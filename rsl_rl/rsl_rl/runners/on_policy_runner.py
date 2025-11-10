@@ -48,6 +48,7 @@ class OnPolicyRunner:
 
         # resolve dimensions of observations
         obs, extras = self.env.get_observations()
+        self._debug_print_observation_breakdown(obs, extras)
         num_obs = obs.shape[1]
 
         # resolve type of privileged observations
@@ -168,6 +169,8 @@ class OnPolicyRunner:
 
         # start learning
         obs, extras = self.env.get_observations()
+
+
         privileged_obs = extras["observations"].get(self.privileged_obs_type, obs)
         obs, privileged_obs = obs.to(self.device), privileged_obs.to(self.device)
         self.train_mode()  # switch to train mode (for dropout for example)
@@ -192,7 +195,7 @@ class OnPolicyRunner:
             self.alg.broadcast_parameters()
             # TODO: Do we need to synchronize empirical normalizers?
             #   Right now: No, because they all should converge to the same values "asymptotically".
-
+        
         # Start training
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
@@ -538,3 +541,168 @@ class OnPolicyRunner:
         torch.distributed.init_process_group(backend="nccl", rank=self.gpu_global_rank, world_size=self.gpu_world_size)
         # set device to the local rank
         torch.cuda.set_device(self.gpu_local_rank)
+
+    def _debug_print_observation_breakdown(self, obs: torch.Tensor, extras: dict) -> None:
+        if getattr(self, "_obs_debug_printed", False):
+            return
+
+        try:
+            observations_cfg = getattr(getattr(self.env, "cfg", None), "observations", None)
+            policy_cfg = getattr(observations_cfg, "policy", None)
+            critic_cfg = getattr(observations_cfg, "critic", None)
+
+            policy_history = int(getattr(policy_cfg, "history_length", 1) or 1)
+            critic_history = int(getattr(critic_cfg, "history_length", 1) or 1)
+            policy_concat = getattr(policy_cfg, "concatenate_terms", True)
+            critic_concat = getattr(critic_cfg, "concatenate_terms", True)
+            if not policy_concat:
+                print("[OBS DEBUG] Warning: policy observations are not concatenated; breakdown may be partial.")
+            if critic_cfg is not None and not critic_concat:
+                print("[OBS DEBUG] Warning: critic observations are not concatenated; breakdown may be partial.")
+
+            policy_obs = obs.detach()
+            num_envs, policy_total_dim = policy_obs.shape
+            observations_dict = extras.get("observations", {}) if isinstance(extras, dict) else {}
+            critic_obs = observations_dict.get("critic")
+
+            if policy_history <= 0:
+                policy_history = 1
+
+            
+
+            if policy_total_dim % policy_history != 0:
+                print(
+                    f"[OBS DEBUG] Policy observation dim {policy_total_dim} not divisible by history_length={policy_history}."
+                )
+                policy_per_step = policy_total_dim
+                policy_history = 1
+            else:
+                policy_per_step = policy_total_dim // policy_history
+
+            critic_per_step = None
+            if critic_obs is not None:
+                critic_obs = critic_obs.detach()
+                _, critic_total_dim = critic_obs.shape
+                if critic_history <= 0:
+                    critic_history = 1
+                if critic_total_dim % critic_history != 0:
+                    print(
+                        f"[OBS DEBUG] Critic observation dim {critic_total_dim} not divisible by history_length={critic_history}."
+                    )
+                    critic_per_step = critic_total_dim
+                    critic_history = 1
+                else:
+                    critic_per_step = critic_total_dim // critic_history
+
+            joint_dim = None
+            terrain_dim = None
+            base_scalar_dim = 12
+
+            if critic_per_step is not None:
+                joint_dim = max(critic_per_step - policy_per_step, 0)
+                terrain_dim = policy_per_step - base_scalar_dim - 3 * joint_dim
+            else:
+                terrain_dim = None
+
+            if terrain_dim is not None and terrain_dim < 0:
+                print(
+                    f"[OBS DEBUG] Derived negative terrain dimension ({terrain_dim}). Check observation configuration."
+                )
+                terrain_dim = None
+
+            proprio_dim = policy_per_step - (terrain_dim or 0) if terrain_dim is not None else policy_per_step
+
+            if joint_dim is not None and terrain_dim is not None:
+                policy_terms = [
+                    ("base_lin_vel", 3),
+                    ("base_ang_vel", 3),
+                    ("projected_gravity", 3),
+                    ("velocity_commands", 3),
+                    ("joint_pos_rel", joint_dim),
+                    ("joint_vel_rel", joint_dim),
+                    ("last_action", joint_dim),
+                ]
+                if terrain_dim:
+                    policy_terms.append(("height_scanner", terrain_dim))
+                critic_terms = [
+                    ("base_lin_vel", 3),
+                    ("base_ang_vel", 3),
+                    ("projected_gravity", 3),
+                    ("velocity_commands", 3),
+                    ("joint_pos_rel", joint_dim),
+                    ("joint_vel_rel", joint_dim),
+                    ("joint_effort", joint_dim),
+                    ("last_action", joint_dim),
+                ]
+                if terrain_dim:
+                    critic_terms.append(("height_scanner", terrain_dim))
+            else:
+                policy_terms = []
+                critic_terms = []
+
+            print("[OBS DEBUG] ========= Observation Breakdown =========")
+            print(f"[OBS DEBUG] num_envs: {num_envs}")
+            print(
+                f"[OBS DEBUG] policy_obs shape: {tuple(policy_obs.shape)} | history_length: {policy_history} | per_step_dim: {policy_per_step}"
+            )
+            if critic_obs is not None:
+                print(
+                    f"[OBS DEBUG] critic_obs shape: {tuple(critic_obs.shape)} | history_length: {critic_history} | per_step_dim: {critic_per_step}"
+                )
+            if joint_dim is not None and terrain_dim is not None:
+                proprio_dim = policy_per_step - (terrain_dim or 0)
+                print(
+                    "[OBS DEBUG] Derived per-step dims -> "
+                    f"proprioceptive: {proprio_dim}, terrain: {terrain_dim or 0}, base_scalars: {base_scalar_dim}, joints: {joint_dim}"
+                )
+
+            if policy_history > 1:
+                policy_blocks = policy_obs.reshape(num_envs, policy_history, policy_per_step)
+                print("reshaped observations for history view: ",policy_blocks)
+                print(
+                    f"[OBS DEBUG] policy history view: {tuple(policy_blocks.shape)} (envs, history, per_step)"
+                )
+                if terrain_dim:
+                    print(
+                        f"[OBS DEBUG]   proprio history shape: {tuple(policy_blocks[..., :proprio_dim].shape)}"
+                    )
+                    print(
+                        f"[OBS DEBUG]   height history shape: {tuple(policy_blocks[..., -terrain_dim:].shape)}"
+                    )
+                last_policy_frame = policy_blocks[0, -1]
+            else:
+                last_policy_frame = policy_obs[0]
+
+            if policy_terms:
+                print("[OBS DEBUG] policy latest frame term shapes:")
+                offset = 0
+                for name, term_dim in policy_terms:
+                    next_offset = offset + term_dim
+                    term_slice = last_policy_frame[offset:next_offset]
+                    print(f"[OBS DEBUG]   {name:>18s}: {(term_dim,)}")
+                    offset = next_offset
+
+            if critic_obs is not None and critic_terms:
+                if critic_history > 1:
+                    critic_blocks = critic_obs.reshape(num_envs, critic_history, critic_per_step)
+                    last_critic_frame = critic_blocks[0, -1]
+                else:
+                    last_critic_frame = critic_obs[0]
+                print("[OBS DEBUG] critic latest frame term shapes:")
+                offset = 0
+                for name, term_dim in critic_terms:
+                    next_offset = offset + term_dim
+                    print(f"[OBS DEBUG]   {name:>18s}: {(term_dim,)}")
+                    offset = next_offset
+
+            if terrain_dim:
+                tail_height = last_policy_frame[-terrain_dim:]
+                if not tail_height.numel():
+                    print("[OBS DEBUG] Warning: Derived terrain slice is empty.")
+
+            print("[OBS DEBUG] =========================================")
+
+        except Exception as exc:
+            print(f"[OBS DEBUG] Failed to analyze observation breakdown: {exc}")
+        finally:
+            self._obs_debug_printed = True
