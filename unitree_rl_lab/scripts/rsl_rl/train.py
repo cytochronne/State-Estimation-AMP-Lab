@@ -54,6 +54,22 @@ args_cli, hydra_args = parser.parse_known_args()
 if args_cli.video:
     args_cli.enable_cameras = True
 
+import os as _os
+if getattr(args_cli, "device", None) and isinstance(args_cli.device, str) \
+        and args_cli.device.startswith("cuda:") and not args_cli.distributed:
+    try:
+        _idx = int(args_cli.device.split(":")[1])
+        _os.environ["CUDA_VISIBLE_DEVICES"] = str(_idx)
+        # 可选：缓解碎片化
+        _os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+        # 进程内改用 cuda:0（此时的 0 对应物理 GPU N）
+        args_cli.device = "cuda:0"
+        print(f"[INFO] Remapped requested device to single visible GPU: "
+              f"CUDA_VISIBLE_DEVICES={_idx}, internal --device=cuda:0")
+    except Exception as _e:
+        print(f"[WARN] Failed to remap --device '{args_cli.device}': {_e}")
+
+
 # clear out sys.argv for Hydra
 sys.argv = [sys.argv[0]] + hydra_args
 

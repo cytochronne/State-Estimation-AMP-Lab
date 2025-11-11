@@ -509,6 +509,15 @@ class OnPolicyRunner:
             self.gpu_local_rank = 0
             self.gpu_global_rank = 0
             self.multi_gpu_cfg = None
+            # 在非分布式情况下，确保 PyTorch 当前设备与传入 device 一致
+            try:
+                if isinstance(self.device, str) and self.device.startswith("cuda:"):
+                    _idx = int(self.device.split(":")[1])
+                    if torch.cuda.is_available():
+                        torch.cuda.set_device(_idx)
+                        print(f"[INFO] Set torch current device to cuda:{_idx} (non-distributed).")
+            except Exception as _e:
+                print(f"[WARN] Unable to set torch current device: {self.device}. Reason: {_e}")
             return
 
         # get rank and world size
