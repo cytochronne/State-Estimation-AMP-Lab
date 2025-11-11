@@ -5,16 +5,18 @@
 
 from __future__ import annotations
 
+import math
+
+import torch.nn.functional as F
 import torch
 import torch.nn as nn
 from torch.distributions import Normal
-from typing import Sequence
+from typing import Sequence, Tuple
 
-from rsl_rl.networks import Memory
-from rsl_rl.utils import resolve_nn_activation, unpad_trajectories
+from rsl_rl.utils import resolve_nn_activation
 
 
-class TerrainAwareRecurrentActorCritic(nn.Module):
+class TerrainAwareActorCritic(nn.Module):
     """Recurrent actor-critic that encodes terrain scans and temporal context separately.
 
     The observation is split into two parts:
@@ -23,7 +25,7 @@ class TerrainAwareRecurrentActorCritic(nn.Module):
     The concatenated features are consumed by standard actor / critic heads.
     """
 
-    is_recurrent = True
+    is_recurrent = False
 
     def __init__(
         self,
@@ -32,22 +34,24 @@ class TerrainAwareRecurrentActorCritic(nn.Module):
         num_actions: int,
         *,
         height_obs_dim: int,
-    actor_hidden_dims: Sequence[int] = (256, 256, 256),
-    critic_hidden_dims: Sequence[int] = (256, 256, 256),
-    height_encoder_dims: Sequence[int] | None = (256, 128),
-    fusion_encoder_dims: Sequence[int] | None = (256, 256),
+        actor_hidden_dims: Sequence[int] = (256, 256, 256),
+        critic_hidden_dims: Sequence[int] = (256, 256, 256),
+        fusion_encoder_dims: Sequence[int] | None = (256, 128, 96),
+        height_cnn_channels: Sequence[int] = (16, 32),
+        height_map_shape: Tuple[int, int] | None = None,
         activation: str = "elu",
+        init_noise_std: float = 1.0,
+        noise_std_type: str = "scalar",
+        height_encoder_dims: Sequence[int] | None = None,
         rnn_type: str = "lstm",
         rnn_hidden_dim: int = 256,
         rnn_num_layers: int = 1,
-        init_noise_std: float = 1.0,
-        noise_std_type: str = "scalar",
         **kwargs,
     ) -> None:
         super().__init__()
         if kwargs:
             print(
-                "TerrainAwareRecurrentActorCritic.__init__ got unexpected arguments, which will be ignored: "
+                "TerrainAwareActorCritic.__init__ got unexpected arguments, which will be ignored: "
                 + str(list(kwargs.keys()))
             )
 
@@ -75,23 +79,14 @@ class TerrainAwareRecurrentActorCritic(nn.Module):
 
         activation_name = activation
 
-        # Terrain encoder
-        self.height_encoder, self.height_embedding_dim = self._build_height_encoder(
-            self.actor_height_dim, height_encoder_dims, activation_name
+        self.height_map_shape = self._resolve_height_map_shape(height_obs_dim, height_map_shape)
+        self.height_encoder, self.height_embedding_dim = self._build_height_cnn(
+            self.height_map_shape, height_cnn_channels, activation_name
         )
 
-        # Recurrent memories for proprioceptive streams
-        self.memory_actor = Memory(
-            input_size=self.actor_core_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim
-        )
-        self.memory_critic = Memory(
-            input_size=self.critic_core_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim
-        )
+        actor_fusion_in_dim = self.actor_core_dim + self.height_embedding_dim
+        critic_fusion_in_dim = self.critic_core_dim + self.height_embedding_dim
 
-        # Policy and value heads
-        actor_fusion_in_dim = self.actor_core_dim + rnn_hidden_dim + self.height_embedding_dim
-        critic_fusion_in_dim = self.critic_core_dim + rnn_hidden_dim + self.height_embedding_dim
-        
         self.actor_fusion_encoder, self.actor_fusion_dim = self._build_fusion_encoder(
             actor_fusion_in_dim, fusion_encoder_dims, activation_name
         )
@@ -102,11 +97,11 @@ class TerrainAwareRecurrentActorCritic(nn.Module):
         self.actor = self._build_head(self.actor_fusion_dim, actor_hidden_dims, num_actions, activation_name)
         self.critic = self._build_head(self.critic_fusion_dim, critic_hidden_dims, 1, activation_name)
 
-        print(f"Terrain encoder MLP: {self.height_encoder}")
+        print(f"Terrain encoder CNN: {self.height_encoder}")
         print(f"Actor fusion encoder: {self.actor_fusion_encoder}")
         print(f"Critic fusion encoder: {self.critic_fusion_encoder}")
-        print(f"Actor recurrent head: {self.actor}")
-        print(f"Critic recurrent head: {self.critic}")
+        print(f"Actor head: {self.actor}")
+        print(f"Critic head: {self.critic}")
 
         # Action noise configuration
         self.noise_std_type = noise_std_type
@@ -119,6 +114,31 @@ class TerrainAwareRecurrentActorCritic(nn.Module):
 
         Normal.set_default_validate_args(False)
         self.distribution = None
+
+    @staticmethod
+    def _resolve_height_map_shape(height_dim: int, explicit_shape: Tuple[int, int] | None) -> Tuple[int, int]:
+        if height_dim == 0:
+            return 0, 0
+
+        if explicit_shape is not None:
+            if explicit_shape[0] * explicit_shape[1] != height_dim:
+                raise ValueError(
+                    "Provided height_map_shape does not match height_obs_dim. "
+                    f"Got {explicit_shape[0]}x{explicit_shape[1]} != {height_dim}."
+                )
+            return explicit_shape
+
+        factors: list[Tuple[int, int]] = []
+        for h in range(1, int(math.sqrt(height_dim)) + 1):
+            if height_dim % h == 0:
+                factors.append((h, height_dim // h))
+
+        if not factors:
+            raise ValueError(f"Unable to factorize height_obs_dim={height_dim} into a 2D map shape.")
+
+        # choose the pair with the smallest aspect ratio difference to keep the map near-square
+        best_h, best_w = min(factors, key=lambda hw: abs(hw[0] - hw[1]))
+        return best_h, best_w
 
     @staticmethod
     def _build_head(input_dim: int, hidden_dims: Sequence[int], output_dim: int, activation_name: str) -> nn.Sequential:
@@ -137,21 +157,28 @@ class TerrainAwareRecurrentActorCritic(nn.Module):
         return nn.Sequential(*layers)
 
     @staticmethod
-    def _build_height_encoder(
-        input_dim: int, hidden_dims: Sequence[int] | None, activation_name: str
+    def _build_height_cnn(
+        map_shape: Tuple[int, int],
+        channels: Sequence[int],
+        activation_name: str,
     ) -> tuple[nn.Module, int]:
-        if input_dim == 0 or not hidden_dims:
-            return nn.Identity(), input_dim
+        height, width = map_shape
+        if height == 0 or width == 0:
+            return nn.Identity(), 0
 
-        dims = list(hidden_dims)
         layers: list[nn.Module] = []
-        prev_dim = input_dim
-        for idx, dim in enumerate(dims):
-            layers.append(nn.Linear(prev_dim, dim))
-            if idx < len(dims) - 1:
-                layers.append(resolve_nn_activation(activation_name))
-            prev_dim = dim
-        return nn.Sequential(*layers), dims[-1]
+        in_channels = 1
+        current_h, current_w = height, width
+        for idx, out_channels in enumerate(channels):
+            stride = 2 if current_h >= 4 and current_w >= 4 else 1
+            layers.append(nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1))
+            layers.append(resolve_nn_activation(activation_name))
+            in_channels = out_channels
+            current_h = math.floor((current_h + 2 - 3) / stride + 1)
+            current_w = math.floor((current_w + 2 - 3) / stride + 1)
+        layers.append(nn.Flatten())
+        embedding_dim = in_channels * max(current_h, 1) * max(current_w, 1)
+        return nn.Sequential(*layers), embedding_dim
 
     @staticmethod
     def _build_fusion_encoder(
@@ -174,76 +201,46 @@ class TerrainAwareRecurrentActorCritic(nn.Module):
         return nn.Sequential(*layers), dims[-1]
 
     def reset(self, dones=None):
-        self.memory_actor.reset(dones)
-        self.memory_critic.reset(dones)
+        return None
 
     def get_hidden_states(self):
-        return self.memory_actor.hidden_states, self.memory_critic.hidden_states
+        return None, None
 
     def detach_hidden_states(self, dones=None):
-        self.memory_actor.detach_hidden_states(dones)
-        self.memory_critic.detach_hidden_states(dones)
+        return None
 
     def _split_obs(self, obs: torch.Tensor, height_dim: int) -> tuple[torch.Tensor, torch.Tensor]:
         if height_dim == 0:
             return obs, torch.empty(obs.shape[:-1] + (0,), device=obs.device, dtype=obs.dtype)
         return obs[..., :-height_dim], obs[..., -height_dim:]
 
-    def _encode_height(self, height: torch.Tensor, masks: torch.Tensor | None) -> torch.Tensor:
-        if height.shape[-1] == 0:
+    def _encode_height(self, height: torch.Tensor, height_dim: int) -> torch.Tensor:
+        if height_dim == 0 or height.shape[-1] == 0:
             return height[..., :0]
 
-        if masks is None:
-            return self.height_encoder(height)
+        batch_shape = height.shape[:-1]
+        height_flat = height.view(-1, height_dim)
+        height_map = height_flat.view(-1, 1, *self.height_map_shape)
+        encoded = self.height_encoder(height_map)
+        return encoded.view(*batch_shape, -1)
 
-        time_steps, batch_size = height.shape[0], height.shape[1]
-        height_flat = height.reshape(time_steps * batch_size, -1)
-        encoded = self.height_encoder(height_flat)
-        encoded = encoded.view(time_steps, batch_size, -1)
-        encoded = unpad_trajectories(encoded, masks)
-        return encoded.squeeze(0)
-
-    def _prepare_features(
-        self,
-        observations: torch.Tensor,
-        masks: torch.Tensor | None,
-        hidden_states,
-        memory: Memory,
-        height_dim: int,
-        fusion_encoder: nn.Module,
-    ) -> torch.Tensor:
+    def _prepare_features(self, observations: torch.Tensor, height_dim: int, fusion_encoder: nn.Module) -> torch.Tensor:
         core, height = self._split_obs(observations, height_dim)
-        rnn_out = memory(core, masks, hidden_states).squeeze(0)
-        height_feat = self._encode_height(height, masks)
-        core_feat = self._encode_core(core, masks)
-
-        features = []
-        if core_feat.numel() != 0:
-            features.append(core_feat)
-        if rnn_out.numel() != 0:
-            features.append(rnn_out)
+        height_feat = self._encode_height(height, height_dim)
         if height_feat.numel() != 0:
-            features.append(height_feat)
-
-        if not features:
-            raise RuntimeError("No features available for fusion. Check observation configuration.")
-
-        fusion_input = features[0] if len(features) == 1 else torch.cat(features, dim=-1)
+            fusion_input = torch.cat((core, height_feat), dim=-1)
+        else:
+            fusion_input = core
         return fusion_encoder(fusion_input)
-
-    @staticmethod
-    def _encode_core(core: torch.Tensor, masks: torch.Tensor | None) -> torch.Tensor:
-        if core.shape[-1] == 0:
-            return core[..., :0]
-        if masks is None:
-            return core
-        encoded = unpad_trajectories(core, masks)
-        return encoded.squeeze(0)
 
     def update_distribution(self, features: torch.Tensor) -> None:
         mean = self.actor(features)
         if self.noise_std_type == "scalar":
-            std = self.std.expand_as(mean)
+            raw = self.std  # nn.Parameter(...), shape maybe [action_dim] or scalar
+            # 把 raw 转到 mean 的 device/dtype
+            raw = raw.to(device=mean.device, dtype=mean.dtype)
+            std_unclamped = F.softplus(raw)  # > 0
+            std = (std_unclamped + 1e-6).expand_as(mean)
         elif self.noise_std_type == "log":
             std = torch.exp(self.log_std).expand_as(mean)
         else:
@@ -251,37 +248,16 @@ class TerrainAwareRecurrentActorCritic(nn.Module):
         self.distribution = Normal(mean, std)
 
     def act(self, observations, masks=None, hidden_states=None):
-        features = self._prepare_features(
-            observations,
-            masks,
-            hidden_states,
-            self.memory_actor,
-            self.actor_height_dim,
-            self.actor_fusion_encoder,
-        )
+        features = self._prepare_features(observations, self.actor_height_dim, self.actor_fusion_encoder)
         self.update_distribution(features)
         return self.distribution.sample()
 
     def act_inference(self, observations):
-        features = self._prepare_features(
-            observations,
-            None,
-            None,
-            self.memory_actor,
-            self.actor_height_dim,
-            self.actor_fusion_encoder,
-        )
+        features = self._prepare_features(observations, self.actor_height_dim, self.actor_fusion_encoder)
         return self.actor(features)
 
     def evaluate(self, critic_observations, masks=None, hidden_states=None):
-        features = self._prepare_features(
-            critic_observations,
-            masks,
-            hidden_states,
-            self.memory_critic,
-            self.critic_height_dim,
-            self.critic_fusion_encoder,
-        )
+        features = self._prepare_features(critic_observations, self.critic_height_dim, self.critic_fusion_encoder)
         return self.critic(features)
 
     def get_actions_log_prob(self, actions):

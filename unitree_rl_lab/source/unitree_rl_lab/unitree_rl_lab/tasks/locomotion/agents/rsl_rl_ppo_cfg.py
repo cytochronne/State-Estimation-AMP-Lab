@@ -9,10 +9,10 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 
 @configclass
 class TerrainAwarePpoActorCriticCfg(RslRlPpoActorCriticCfg):
-    class_name = "TerrainAwareRecurrentActorCritic"
+    class_name = "TerrainAwareActorCritic"
     height_obs_dim: int = 0
     height_encoder_dims = (256, 128)
-    fusion_encoder_dims = (256, 256)
+    fusion_encoder_dims = (256, 128, 96)
     rnn_type = "lstm"
     rnn_hidden_dim = 256
     rnn_num_layers = 1
