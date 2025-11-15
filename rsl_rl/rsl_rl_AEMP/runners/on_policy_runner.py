@@ -95,10 +95,26 @@ class OnPolicyRunner:
             self.alg_cfg["symmetry_cfg"]["_env"] = env
 
         # initialize algorithm
-        alg_class = eval(self.alg_cfg.pop("class_name"))
-        self.alg: PPO | Distillation = alg_class(
-            policy, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg
-        )
+        alg_cfg = dict(self.alg_cfg)
+        alg_class = eval(alg_cfg.pop("class_name"))
+        if self.training_type == "distillation":
+            discriminator_cfg = alg_cfg.pop("discriminator_cfg", None)
+            adv_loss_weight = alg_cfg.pop("adv_loss_weight", 0.0)
+            self.alg: PPO | Distillation = alg_class(
+                policy,
+                device=self.device,
+                discriminator_cfg=discriminator_cfg,
+                adv_loss_weight=adv_loss_weight,
+                **alg_cfg,
+                multi_gpu_cfg=self.multi_gpu_cfg,
+            )
+        else:
+            # remove discriminator-specific arguments if present due to shared configs
+            alg_cfg.pop("discriminator_cfg", None)
+            alg_cfg.pop("adv_loss_weight", None)
+            self.alg: PPO | Distillation = alg_class(
+                policy, device=self.device, **alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg
+            )
 
         # store training configuration
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
@@ -412,6 +428,10 @@ class OnPolicyRunner:
             "iter": self.current_learning_iteration,
             "infos": infos,
         }
+        if getattr(self.alg, "discriminator", None) is not None:
+            saved_dict["discriminator_state_dict"] = self.alg.discriminator.state_dict()
+            if getattr(self.alg, "discriminator_optimizer", None) is not None:
+                saved_dict["discriminator_optimizer_state_dict"] = self.alg.discriminator_optimizer.state_dict()
         # -- Save RND model if used
         if self.alg.rnd:
             saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
@@ -432,6 +452,15 @@ class OnPolicyRunner:
         loaded_dict = torch.load(path, weights_only=False)
         # -- Load model
         resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
+        if getattr(self.alg, "discriminator", None) is not None and "discriminator_state_dict" in loaded_dict:
+            self.alg.discriminator.load_state_dict(loaded_dict["discriminator_state_dict"])
+            self.alg.discriminator.train()
+            if (
+                load_optimizer
+                and "discriminator_optimizer_state_dict" in loaded_dict
+                and getattr(self.alg, "discriminator_optimizer", None) is not None
+            ):
+                self.alg.discriminator_optimizer.load_state_dict(loaded_dict["discriminator_optimizer_state_dict"])
         # -- Load RND model if used
         if self.alg.rnd:
             self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])

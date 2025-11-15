@@ -13,6 +13,7 @@ from .student_teacher import StudentTeacher
 from .student_teacher_recurrent import StudentTeacherRecurrent
 from .terrain_aware_actor_critic import TerrainAwareActorCritic
 from .terrain_aware_student_teacher import TerrainAwareStudentTeacher
+from .discriminatorAEP import Discriminator
 
 __all__ = [
     "ActorCritic",
@@ -23,4 +24,5 @@ __all__ = [
     "StudentTeacherRecurrent",
     "TerrainAwareActorCritic",
     "TerrainAwareStudentTeacher",
+    "Discriminator",
 ]

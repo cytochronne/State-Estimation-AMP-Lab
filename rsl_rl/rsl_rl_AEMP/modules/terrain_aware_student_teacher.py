@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from typing import Sequence, Tuple
+from typing import Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -204,9 +204,14 @@ class TerrainAwareStudentTeacher(nn.Module):
         self.update_distribution(features)
         return self.distribution.sample()
 
-    def act_inference(self, observations: torch.Tensor) -> torch.Tensor:
+    def act_inference(
+        self, observations: torch.Tensor, *, return_latent: bool = False
+    ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         features = self._prepare_student_features(observations)
-        return self.student_policy_head(features)
+        actions_mean = self.student_policy_head(features)
+        if return_latent:
+            return actions_mean, features
+        return actions_mean
 
     def evaluate(self, teacher_observations: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
@@ -219,6 +224,9 @@ class TerrainAwareStudentTeacher(nn.Module):
                 self.teacher.actor_height_dim,
                 self.teacher.actor_fusion_encoder,
             )
+
+    def get_student_latent(self, observations: torch.Tensor) -> torch.Tensor:
+        return self._prepare_student_features(observations)
 
     def reset(self, dones=None, hidden_states=None):
         if hidden_states is None:

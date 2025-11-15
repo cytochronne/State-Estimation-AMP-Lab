@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.optim as optim
 
 # rsl-rl
-from rsl_rl_AEMP.modules import StudentTeacher, StudentTeacherRecurrent
+from rsl_rl_AEMP.modules import Discriminator, StudentTeacher, StudentTeacherRecurrent
 from rsl_rl_AEMP.storage import RolloutStorage
 
 
@@ -28,6 +28,8 @@ class Distillation:
         max_grad_norm=None,
         loss_type="mse",
         device="cpu",
+        discriminator_cfg: dict | None = None,
+        adv_loss_weight: float = 0.0,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
     ):
@@ -47,6 +49,11 @@ class Distillation:
         # distillation components
         self.policy = policy
         self.policy.to(self.device)
+        self.discriminator = None
+        self.discriminator_optimizer = None
+        self.discriminator_updates = 1
+        self.discriminator_grad_pen_lambda = 0.0
+        self.adv_loss_weight = adv_loss_weight
         self.storage = None  # initialized later
         self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
         self.transition = RolloutStorage.Transition()
@@ -67,6 +74,38 @@ class Distillation:
             raise ValueError(f"Unknown loss type: {loss_type}. Supported types are: mse, huber")
 
         self.num_updates = 0
+
+        if discriminator_cfg is not None:
+            self._build_discriminator(discriminator_cfg, learning_rate)
+
+    def _build_discriminator(self, cfg: dict, default_lr: float) -> None:
+        cfg = dict(cfg)
+
+        hidden_dims = cfg.get("hidden_layer_sizes", [256, 256])
+        input_dim = cfg.get("input_dim", getattr(self.policy, "teacher_latent_dim", None))
+        if input_dim is None:
+            raise ValueError(
+                "Could not infer discriminator input dimension. Please provide 'input_dim' in discriminator_cfg "
+                "or ensure the policy exposes 'teacher_latent_dim'."
+            )
+
+        loss_type = cfg.get("loss_type", "BCEWithLogits")
+        use_minibatch_std = cfg.get("use_minibatch_std", True)
+        eta_wgan = cfg.get("eta_wgan", 0.3)
+
+        self.discriminator = Discriminator(
+            input_dim=input_dim,
+            hidden_layer_sizes=hidden_dims,
+            device=self.device,
+            loss_type=loss_type,
+            eta_wgan=eta_wgan,
+            use_minibatch_std=use_minibatch_std,
+        )
+        disc_lr = cfg.get("learning_rate", default_lr)
+        self.discriminator_optimizer = optim.Adam(self.discriminator.parameters(), lr=disc_lr)
+        self.discriminator_updates = int(cfg.get("updates_per_step", 1))
+        self.discriminator_grad_pen_lambda = float(cfg.get("grad_penalty_lambda", 0.0))
+        self.discriminator.train()
 
     def init_storage(
         self, training_type, num_envs, num_transitions_per_env, student_obs_shape, teacher_obs_shape, actions_shape
@@ -103,23 +142,61 @@ class Distillation:
 
     def update(self):
         self.num_updates += 1
-        mean_behavior_loss = 0
-        loss = 0
+        mean_behavior_loss = 0.0
+        mean_adv_loss = 0.0
+        mean_disc_loss = 0.0
+        loss = 0.0
         cnt = 0
+        adv_cnt = 0
+        disc_cnt = 0
 
         for epoch in range(self.num_learning_epochs):
             self.policy.reset(hidden_states=self.last_hidden_states)
             self.policy.detach_hidden_states()
-            for obs, _, _, privileged_actions, dones in self.storage.generator():
+            if self.discriminator is not None:
+                self.discriminator.train()
+            for obs, privileged_obs, _, privileged_actions, dones in self.storage.generator():
 
                 # inference the student for gradient computation
-                actions = self.policy.act_inference(obs)
+                actions, student_latent = self.policy.act_inference(obs, return_latent=True)
 
                 # behavior cloning loss
                 behavior_loss = self.loss_fn(actions, privileged_actions)
 
+                total_loss = behavior_loss
+
+                if self.discriminator is not None:
+                    with torch.no_grad():
+                        teacher_latent = self.policy.evaluate_feature(privileged_obs)
+
+                    disc_loss_value = 0.0
+                    for _ in range(self.discriminator_updates):
+                        self.discriminator_optimizer.zero_grad()
+                        disc_loss = self.discriminator.discriminator_loss(
+                            student_latent.detach(), teacher_latent
+                        )
+                        grad_pen = self.discriminator.compute_grad_pen(
+                            teacher_latent, student_latent.detach(), self.discriminator_grad_pen_lambda
+                        )
+                        disc_total = disc_loss + grad_pen
+                        disc_total.backward()
+                        if self.is_multi_gpu:
+                            self._reduce_module_gradients(self.discriminator)
+                        self.discriminator_optimizer.step()
+                        disc_loss_value += disc_total.item()
+
+                    disc_loss_value /= max(self.discriminator_updates, 1)
+                    mean_disc_loss += disc_loss_value
+                    disc_cnt += 1
+
+                    if self.adv_loss_weight != 0.0:
+                        adv_loss = self.discriminator.generator_loss(student_latent)
+                        total_loss = total_loss + self.adv_loss_weight * adv_loss
+                        mean_adv_loss += adv_loss.item()
+                        adv_cnt += 1
+
                 # total loss
-                loss = loss + behavior_loss
+                loss = loss + total_loss
                 mean_behavior_loss += behavior_loss.item()
                 cnt += 1
 
@@ -133,19 +210,28 @@ class Distillation:
                         nn.utils.clip_grad_norm_(self.policy.student.parameters(), self.max_grad_norm)
                     self.optimizer.step()
                     self.policy.detach_hidden_states()
-                    loss = 0
+                    loss = 0.0
 
                 # reset dones
                 self.policy.reset(dones.view(-1))
                 self.policy.detach_hidden_states(dones.view(-1))
 
-        mean_behavior_loss /= cnt
+        mean_behavior_loss /= max(cnt, 1)
+        if self.discriminator is not None and adv_cnt > 0:
+            mean_adv_loss /= adv_cnt
+        if self.discriminator is not None and disc_cnt > 0:
+            mean_disc_loss /= disc_cnt
         self.storage.clear()
         self.last_hidden_states = self.policy.get_hidden_states()
         self.policy.detach_hidden_states()
 
         # construct the loss dictionary
         loss_dict = {"behavior": mean_behavior_loss}
+        if self.discriminator is not None:
+            if adv_cnt > 0:
+                loss_dict["adv"] = mean_adv_loss
+            if disc_cnt > 0:
+                loss_dict["disc"] = mean_disc_loss
 
         return loss_dict
 
@@ -157,10 +243,14 @@ class Distillation:
         """Broadcast model parameters to all GPUs."""
         # obtain the model parameters on current GPU
         model_params = [self.policy.state_dict()]
+        if self.discriminator is not None:
+            model_params.append(self.discriminator.state_dict())
         # broadcast the model parameters
         torch.distributed.broadcast_object_list(model_params, src=0)
         # load the model parameters on all GPUs from source GPU
         self.policy.load_state_dict(model_params[0])
+        if self.discriminator is not None and len(model_params) > 1:
+            self.discriminator.load_state_dict(model_params[1])
 
     def reduce_parameters(self):
         """Collect gradients from all GPUs and average them.
@@ -181,4 +271,21 @@ class Distillation:
                 # copy data back from shared buffer
                 param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
                 # update the offset for the next parameter
+                offset += numel
+
+    def _reduce_module_gradients(self, module: nn.Module) -> None:
+        if not self.is_multi_gpu:
+            return
+
+        grads = [param.grad.view(-1) for param in module.parameters() if param.grad is not None]
+        if not grads:
+            return
+        all_grads = torch.cat(grads)
+        torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
+        all_grads /= self.gpu_world_size
+        offset = 0
+        for param in module.parameters():
+            if param.grad is not None:
+                numel = param.numel()
+                param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
                 offset += numel
