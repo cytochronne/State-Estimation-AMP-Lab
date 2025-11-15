@@ -142,7 +142,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent_cfg.max_iterations = (
         args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
     )
-
+    
     # Force Weights & Biases logging by default.
     setattr(agent_cfg, "logger", "wandb")
     os.environ["WANDB_BASE_URL"]='https://api.bandw.top'

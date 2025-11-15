@@ -179,7 +179,7 @@ if __name__ == "__main__":
 
 ---
 
-# 🌟 问题背景：不同环境在不同时间 done，历史长度不一致
+## 🌟 问题背景：不同环境在不同时间 done，历史长度不一致
 
 假设你有 3 个并行环境（env0 / env1 / env2），你想给 RNN 输入最近 **3 步观测历史**：
 
@@ -207,7 +207,7 @@ history_length = 3   # T = 3
 
 ---
 
-# ✅ pad 就是用来“补历史”的
+## ✅ pad 就是用来“补历史”的
 
 对缺失的时间步，用某个值（通常是 0）填满：
 
@@ -249,7 +249,7 @@ shape => (T=3, num_envs=3, obs_dim)
 
 ---
 
-# ✅ mask 表示哪些是 pad，哪些是有效
+## ✅ mask 表示哪些是 pad，哪些是有效
 
 同时生成一个 mask：
 
@@ -265,7 +265,7 @@ mask = [
 
 ---
 
-# 🎯 RNN 如何用 pad + mask？
+## 🎯 RNN 如何用 pad + mask？
 
 RNN 会：
 
@@ -276,7 +276,7 @@ RNN 会：
 
 ---
 
-# ✅ unpad 的作用（还原回单步输出）
+## ✅ unpad 的作用（还原回单步输出）
 
 在你的模型里看到：
 
@@ -306,7 +306,7 @@ shape：
 
 ---
 
-# 🚀 总结（一句话）
+## 🚀 总结（一句话）
 
 | 操作        | 作用                                                          |
 | --------- | ----------------------------------------------------------- |
@@ -316,7 +316,7 @@ shape：
 
 ---
 
-# 📌 小实验（可直接运行验证）
+## 📌 小实验（可直接运行验证）
 
 ```python
 import torch
@@ -360,3 +360,227 @@ tensor([[4,4,4,4],
 ---
 
 prepare_features里的observation是经过padding的吗
+
+# 观察与extras
+先给你一个结论版，然后再一点点拆开👇
+
+---
+
+## 1. `obs, extras = self.env.get_observations()` 里的 `extras` 到底是啥？
+
+在 **IsaacLab + RSL-RL** 的封装里：
+
+* `obs`：给 **“主策略”/学生 (policy)** 用的观测（通常就是 `ObservationsCfg.PolicyCfg` 这组，被拼成一个 `(num_envs, obs_dim)` 的 tensor）。
+* `extras`：一个 **字典**，存放“不是主观测”的各种东西，包括：
+
+  1. 其他 observation group（例如你定义的 `critic` 组 = 老师/privileged obs）
+  2. 各种环境内部记录的额外信息（如 episode 统计、log 信息、time_outs 等，具体由 env / wrapper 决定）
+
+RSL-RL 的 `RslRlVecEnvWrapper` 里有一段逻辑（伪代码）大概是这样的（你可以把这个当 mental model）：
+
+```python
+obs_dict = env.obs_buf  # 这里是一个 {group_name: tensor} 的 dict
+
+# 选出主观测（一般是 "policy" 组），作为 RL 中的 obs
+policy_obs = obs_dict["policy"]
+
+extras = {}
+# 其余组（比如 "critic"）被认为是 extra observations，放进 extras
+extra_obs_groups = {k: v for k, v in obs_dict.items() if k != "policy"}
+if extra_obs_groups:
+    extras["observations"] = extra_obs_groups
+
+# 此外还会把 env.extras 里的内容合并进来（如 log、time_outs 等）
+extras.update(env.extras)
+
+return policy_obs, extras
+```
+
+所以：**`extras` 里既可能有你的“老师观测”，也可能有 logging / time_out 标记等其它东西。**
+
+---
+
+## 2. 就你这份 `RobotEnvCfg`，哪些东西会进到 `extras`？
+
+看你的 `ObservationsCfg`：
+
+```python
+@configclass
+class ObservationsCfg:
+    """Observation specifications for the MDP."""
+
+    @configclass
+    class PolicyCfg(ObsGroup):
+        ...
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+    policy: PolicyCfg = PolicyCfg()
+
+    @configclass
+    class CriticCfg(ObsGroup):
+        ...
+    critic: CriticCfg = CriticCfg()
+```
+
+也就是说：
+
+* env 内部的 **observation_manager.compute()** 会得到一个 **字典**：
+
+  ```python
+  {
+      "policy": <tensor of shape (num_envs, policy_dim)>,
+      "critic": <tensor of shape (num_envs, critic_dim)>
+  }
+  ```
+* 在 `ManagerBasedRLEnv.step()` / `get_observations()` 返回给 RSL-RL wrapper 时：
+
+  * **主观测**：只取 `"policy"` 这一组（给 actor / 学生）
+  * 其它组（这里只有 `"critic"`）会被 wrapper 视为 “extra observations”，放进 `extras`，形式大概类似：
+
+    ```python
+    extras = {
+        "observations": {
+            "critic": critic_obs_tensor,  # (num_envs, critic_dim)
+        },
+        # 还可能有 "log" / "time_outs" 等其它键
+    }
+    ```
+
+再加上 `ManagerBasedEnv` / `ManagerBasedRLEnv` 自己维护的 `self.extras` 字典，里面通常会在：
+
+* reset / step 时被各个 manager 写一些信息：
+
+  * 例如 `reward_manager` 写 episode return
+  * `termination_manager` 写哪些 env 触发了哪类终止
+  * 你手动往里塞的一些 debug metric
+
+RSL-RL 的 wrapper 在 `step()` 时还会把 `truncated`（time_out）也放到 `extras["time_outs"]` 里（用于无限/有限 horizon 的区分）。([docs.robotsfan.com][1])
+
+**简单记忆：**
+
+> 对你这个 env 来说，`obs` ≈ policy 组（学生），
+> `extras["observations"]["critic"]` ≈ critic 组（老师 + privileged obs），
+> 其它诸如 `extras["time_outs"]`、`extras["log"]` 是环境的附加信息。
+
+你可以在代码里直接验证一下（强烈建议）：
+
+```python
+obs, extras = self.env.get_observations()
+print(type(obs), obs.shape)             # (num_envs, policy_dim)
+print(extras.keys())                    # 看看有啥键
+print(extras.get("observations", {}).keys())  # 应该有 "critic"
+print(extras["observations"]["critic"].shape) # (num_envs, critic_dim)
+```
+
+---
+
+## 3. 想分开学生 / 教师观测，应该怎么做？
+
+你现在的配置其实已经是 **经典 student / teacher（actor / critic privileged obs）写法** 了，接下来只要在训练代码里正确取就行。
+
+### 3.1 “学生 / 教师”在这个配置里的对应关系
+
+* 学生（policy / actor）：用 `ObservationsCfg.PolicyCfg` 对应的观测
+
+  * 你已经把 `PolicyCfg.enable_corruption = True`，可以在这里做噪声 / 不完全观测等处理，适合作为 **学生观测**。
+* 老师（critic / privileged）：用 `ObservationsCfg.CriticCfg` 对应的观测
+
+  * 可以包含更多的、甚至是“作弊”的信息（例如真实速度、traj、高度图等），不对真实机器人暴露，只给 critic / teacher 模块用。
+
+这就是 IsaacLab 官方 legged 示例默认采用的“学生 / 老师分观测”的套路。
+
+### 3.2 在训练代码中怎么取？
+
+#### 情形 A：你用的是 RSL-RL + `RslRlVecEnvWrapper`
+
+典型 step / get_observations 写法：
+
+```python
+# 1) 取观测
+obs, extras = env.get_observations()   # obs: 学生; extras: 里面藏着老师
+student_obs = obs                      # shape: (num_envs, policy_dim)
+
+# 2) 从 extras 里取老师（critic）观测
+teacher_obs = None
+if "observations" in extras and "critic" in extras["observations"]:
+    teacher_obs = extras["observations"]["critic"]  # shape: (num_envs, critic_dim)
+
+# 3) 你就可以：
+# - 用 student_obs 喂 actor 网络
+# - 用 teacher_obs 喂 critic 网络 / teacher policy / AMP discriminator 等
+```
+
+如果你自己写 runner，而不是用官方 PPO runner，可以显式把 `teacher_obs` 传给 critic：
+
+```python
+value = critic(student_obs, teacher_obs)  # 或者只传 teacher_obs，看你怎么设计
+```
+
+#### 情形 B：你不想通过 `extras`，想自己手动控制
+
+你也可以直接调用 env 的 observation_manager：
+
+```python
+# 不通过 wrapper，直接问 env 当前所有观测
+obs_dict = env.unwrapped.observation_manager.compute(update_history=False)
+
+student_obs = obs_dict["policy"]   # (num_envs, policy_dim)
+teacher_obs = obs_dict["critic"]   # (num_envs, critic_dim)
+```
+
+这样就完全自己掌控，不依赖 wrapper 帮你塞进 `extras`。
+
+---
+
+## 4. 如果想更明确地区分并 debug 学生 / 老师观测？
+
+给你几个实用操作：
+
+### 4.1 打印 group 信息和 shape
+
+```python
+obs_mgr = env.unwrapped.observation_manager
+print("groups:", obs_mgr.active_terms.keys())
+for group_name in obs_mgr.active_terms:
+    print(group_name,
+          "dim =", obs_mgr.group_obs_dim[group_name],
+          "concat =", obs_mgr.group_obs_concatenate[group_name])
+```
+
+你会看到类似：
+
+* `policy dim = (N,) concat = True`
+* `critic dim = (M,) concat = True`
+
+### 4.2 在一步训练里实际 dump 一下
+
+```python
+obs, extras = env.get_observations()
+print("student_obs:", obs.shape)
+if "observations" in extras:
+    for k, v in extras["observations"].items():
+        print(f"extra obs group {k}: {v.shape}")
+print("extras keys:", extras.keys())
+```
+
+跑几步后，你就非常直观地知道：
+
+* 学生 obs 是什么 shape
+* 老师/critic obs 是在哪里、是什么 shape
+* `extras` 里还有哪些信息可以利用（如 episode 统计、time_outs）
+
+---
+
+## 5. 一句话总结
+
+* **`extras` = “除了主观测以外，我这个 vectorized env 想顺带告诉你的所有东西”的垃圾桶**——包括别的 obs 组（比如 `critic`/老师）、log、time_outs 等。
+* 你的配置已经天然把 **学生** 映射到 `policy` 组，把 **老师 / privileged** 映射到 `critic` 组。
+* 用 `obs, extras = env.get_observations()` 时：
+
+  * `obs` 给学生
+  * 从 `extras["observations"]["critic"]` 拿老师，或者直接用 `observation_manager.compute()` 自己取。
+
+如果你把你现在的训练脚本 core loop 贴一段出来，我还能帮你把“学生/教师观测流向”画成一个简洁的数据流图，你以后看就一目了然 👀
+
+[1]: https://docs.robotsfan.com/isaaclab/_modules/isaaclab_rl/rsl_rl/vecenv_wrapper.html?utm_source=chatgpt.com "isaaclab_rl.rsl_rl.vecenv_wrapper — Isaac Lab 文档"

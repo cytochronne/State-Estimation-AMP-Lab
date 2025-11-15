@@ -13,7 +13,7 @@ import torch.nn as nn
 from torch.distributions import Normal
 from typing import Sequence, Tuple
 
-from rsl_rl.utils import resolve_nn_activation
+from rsl_rl_AEMP.utils import resolve_nn_activation
 
 
 class TerrainAwareActorCritic(nn.Module):

@@ -7,9 +7,9 @@ from __future__ import annotations
 
 import warnings
 
-from rsl_rl.modules import ActorCritic
-from rsl_rl.networks import Memory
-from rsl_rl.utils import resolve_nn_activation
+from rsl_rl_AEMP.modules import ActorCritic
+from rsl_rl_AEMP.networks import Memory
+from rsl_rl_AEMP.utils import resolve_nn_activation
 
 
 class ActorCriticRecurrent(ActorCritic):

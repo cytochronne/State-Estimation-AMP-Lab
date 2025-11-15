@@ -10,10 +10,10 @@ import torch.nn as nn
 import torch.optim as optim
 from itertools import chain
 
-from rsl_rl.modules import ActorCritic
-from rsl_rl.modules.rnd import RandomNetworkDistillation
-from rsl_rl.storage import RolloutStorage
-from rsl_rl.utils import string_to_callable
+from rsl_rl_AEMP.modules import ActorCritic
+from rsl_rl_AEMP.modules.rnd import RandomNetworkDistillation
+from rsl_rl_AEMP.storage import RolloutStorage
+from rsl_rl_AEMP.utils import string_to_callable
 
 
 class PPO:
