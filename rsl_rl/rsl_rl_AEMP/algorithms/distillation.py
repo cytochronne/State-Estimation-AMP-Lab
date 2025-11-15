@@ -55,7 +55,28 @@ class Distillation:
         self.discriminator_grad_pen_lambda = 0.0
         self.adv_loss_weight = adv_loss_weight
         self.storage = None  # initialized later
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+        # only train the student encoder (including recurrent memory)
+        self.encoder_parameters: list[nn.Parameter] = []
+        if hasattr(self.policy, "memory_s"):
+            self.encoder_parameters.extend(p for p in self.policy.memory_s.parameters())
+        student_module = getattr(self.policy, "student", None)
+        if student_module is not None and hasattr(student_module, "get"):
+            encoder_module = student_module.get("encoder")
+            if encoder_module is not None:
+                self.encoder_parameters.extend(p for p in encoder_module.parameters())
+        elif hasattr(self.policy, "student_encoder"):
+            self.encoder_parameters.extend(p for p in self.policy.student_encoder.parameters())
+
+        if not self.encoder_parameters:
+            raise ValueError("No encoder parameters found to optimise. Ensure the policy exposes an encoder module.")
+
+        # freeze other student components if present
+        policy_head = getattr(self.policy, "student_policy_head", None)
+        if policy_head is not None:
+            for param in policy_head.parameters():
+                param.requires_grad_(False)
+
+        self.optimizer = optim.Adam(self.encoder_parameters, lr=learning_rate)
         self.transition = RolloutStorage.Transition()
         self.last_hidden_states = None
 
@@ -123,9 +144,10 @@ class Distillation:
         )
 
     def act(self, obs, teacher_obs):
-        # compute the actions
-        self.transition.actions = self.policy.act(obs).detach()
-        self.transition.privileged_actions = self.policy.evaluate(teacher_obs).detach()
+        # use the teacher to interact with the environment
+        teacher_actions = self.policy.evaluate(teacher_obs).detach()
+        self.transition.actions = teacher_actions
+        self.transition.privileged_actions = teacher_actions
         # record the observations
         self.transition.observations = obs
         self.transition.privileged_observations = teacher_obs
@@ -142,7 +164,6 @@ class Distillation:
 
     def update(self):
         self.num_updates += 1
-        mean_behavior_loss = 0.0
         mean_adv_loss = 0.0
         mean_disc_loss = 0.0
         loss = 0.0
@@ -157,13 +178,9 @@ class Distillation:
                 self.discriminator.train()
             for obs, privileged_obs, _, privileged_actions, dones in self.storage.generator():
 
-                # inference the student for gradient computation
-                actions, student_latent = self.policy.act_inference(obs, return_latent=True)
-
-                # behavior cloning loss
-                behavior_loss = self.loss_fn(actions, privileged_actions)
-
-                total_loss = behavior_loss
+                # compute student and teacher latents
+                student_latent = self.policy.get_student_latent(obs)
+                total_loss = 0.0
 
                 if self.discriminator is not None:
                     with torch.no_grad():
@@ -197,17 +214,17 @@ class Distillation:
 
                 # total loss
                 loss = loss + total_loss
-                mean_behavior_loss += behavior_loss.item()
-                cnt += 1
+                if total_loss != 0.0:
+                    cnt += 1
 
                 # gradient step
-                if cnt % self.gradient_length == 0:
+                if cnt > 0 and cnt % self.gradient_length == 0:
                     self.optimizer.zero_grad()
                     loss.backward()
                     if self.is_multi_gpu:
-                        self.reduce_parameters()
+                        self.reduce_parameters(self.encoder_parameters)
                     if self.max_grad_norm:
-                        nn.utils.clip_grad_norm_(self.policy.student.parameters(), self.max_grad_norm)
+                        nn.utils.clip_grad_norm_(self.encoder_parameters, self.max_grad_norm)
                     self.optimizer.step()
                     self.policy.detach_hidden_states()
                     loss = 0.0
@@ -216,7 +233,17 @@ class Distillation:
                 self.policy.reset(dones.view(-1))
                 self.policy.detach_hidden_states(dones.view(-1))
 
-        mean_behavior_loss /= max(cnt, 1)
+        if cnt > 0 and loss != 0.0:
+            self.optimizer.zero_grad()
+            loss.backward()
+            if self.is_multi_gpu:
+                self.reduce_parameters(self.encoder_parameters)
+            if self.max_grad_norm:
+                nn.utils.clip_grad_norm_(self.encoder_parameters, self.max_grad_norm)
+            self.optimizer.step()
+            self.policy.detach_hidden_states()
+            loss = 0.0
+
         if self.discriminator is not None and adv_cnt > 0:
             mean_adv_loss /= adv_cnt
         if self.discriminator is not None and disc_cnt > 0:
@@ -226,7 +253,7 @@ class Distillation:
         self.policy.detach_hidden_states()
 
         # construct the loss dictionary
-        loss_dict = {"behavior": mean_behavior_loss}
+        loss_dict = {}
         if self.discriminator is not None:
             if adv_cnt > 0:
                 loss_dict["adv"] = mean_adv_loss
@@ -252,20 +279,26 @@ class Distillation:
         if self.discriminator is not None and len(model_params) > 1:
             self.discriminator.load_state_dict(model_params[1])
 
-    def reduce_parameters(self):
+    def reduce_parameters(self, params=None):
         """Collect gradients from all GPUs and average them.
 
         This function is called after the backward pass to synchronize the gradients across all GPUs.
         """
+        if not self.is_multi_gpu:
+            return
+        if params is None:
+            params = self.policy.parameters()
         # Create a tensor to store the gradients
-        grads = [param.grad.view(-1) for param in self.policy.parameters() if param.grad is not None]
+        grads = [param.grad.view(-1) for param in params if param.grad is not None]
+        if not grads:
+            return
         all_grads = torch.cat(grads)
         # Average the gradients across all GPUs
         torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
         all_grads /= self.gpu_world_size
         # Update the gradients for all parameters with the reduced gradients
         offset = 0
-        for param in self.policy.parameters():
+        for param in params:
             if param.grad is not None:
                 numel = param.numel()
                 # copy data back from shared buffer
