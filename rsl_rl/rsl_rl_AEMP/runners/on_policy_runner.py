@@ -21,6 +21,7 @@ from rsl_rl_AEMP.modules import (
     StudentTeacher,
     StudentTeacherRecurrent,
     TerrainAwareActorCritic,
+    TerrainAwareStudentTeacher,
 )
 from rsl_rl_AEMP.utils import store_code_state
 
@@ -60,7 +61,7 @@ class OnPolicyRunner:
         if self.training_type == "distillation":
             if "teacher" in extras["observations"]:
                 self.privileged_obs_type = "teacher"  # policy distillation
-            else:
+            else:   
                 self.privileged_obs_type = None
 
         # resolve dimensions of privileged observations
@@ -71,7 +72,7 @@ class OnPolicyRunner:
 
         # evaluate the policy class
         policy_class = eval(self.policy_cfg.pop("class_name"))
-        policy: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent = policy_class(
+        policy: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent | TerrainAwareStudentTeacher | TerrainAwareActorCritic = policy_class(
             num_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg
         ).to(self.device)
 

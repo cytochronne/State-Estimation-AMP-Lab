@@ -12,6 +12,7 @@ from .rnd import RandomNetworkDistillation
 from .student_teacher import StudentTeacher
 from .student_teacher_recurrent import StudentTeacherRecurrent
 from .terrain_aware_actor_critic import TerrainAwareActorCritic
+from .terrain_aware_student_teacher import TerrainAwareStudentTeacher
 
 __all__ = [
     "ActorCritic",
@@ -21,4 +22,5 @@ __all__ = [
     "StudentTeacher",
     "StudentTeacherRecurrent",
     "TerrainAwareActorCritic",
+    "TerrainAwareStudentTeacher",
 ]

@@ -584,3 +584,394 @@ print("extras keys:", extras.keys())
 如果你把你现在的训练脚本 core loop 贴一段出来，我还能帮你把“学生/教师观测流向”画成一个简洁的数据流图，你以后看就一目了然 👀
 
 [1]: https://docs.robotsfan.com/isaaclab/_modules/isaaclab_rl/rsl_rl/vecenv_wrapper.html?utm_source=chatgpt.com "isaaclab_rl.rsl_rl.vecenv_wrapper — Isaac Lab 文档"
+
+
+# stage2todo
+- module中新的student_teacher_recurrent
+- module: discriminator
+- algorithm: AEP的训练方式：对discriminor的训练 + RL部分
+
+# AMP-rsl_rl
+我先按“监督信号 / loss 结构 / minibatch_std_scalar”三个块来讲，这样你可以直接对照代码理解 AMP 的判别器在干嘛。
+
+---
+
+## 1. 判别器输入 & 监督信号到底是什么？
+
+### 判别器输入是什么？
+
+在 AMP 里，判别器 D 的输入是
+
+> 当前 state 和 next_state 的拼接：`x = cat([state, next_state], dim=-1)`
+
+也就是一条 “transition”（或者说一个片段的局部），既有当前状态，又有下一步状态。
+
+* 对 **expert**：`(state_expert, next_state_expert)`
+* 对 **policy**：`(state_policy, next_state_policy)`
+
+都被拼成一个向量，然后丢进 `Discriminator.forward(x)`：
+
+```python
+def forward(self, x):
+    h = self.trunk(x)        # 多层 MLP
+    if self.use_minibatch_std:
+        s = self._minibatch_std_scalar(h)
+        h = torch.cat([h, s], dim=-1)    # 给每个样本拼一个额外的 1 维特征
+    return self.linear(h)    # 输出 shape: (B, 1) 的 logit / score
+```
+
+**监督信号（标签）非常简单：**
+
+* Expert 轨迹 → label = 1
+* Policy 轨迹 → label = 0
+
+也就是“你是人类示范还是 RL 策略产生的？”
+
+---
+
+## 2. BCE / WGAN 两种 loss 是怎么用的？
+
+### 2.1 `policy_loss` / `expert_loss` 这两个函数在干嘛？
+
+```python
+def policy_loss(self, discriminator_output):
+    expected = torch.zeros_like(discriminator_output, device=self.device)
+    return self.loss_fun(discriminator_output, expected)
+
+def expert_loss(self, discriminator_output):
+    expected = torch.ones_like(discriminator_output, device=self.device)
+    return self.loss_fun(discriminator_output, expected)
+```
+
+这里的 `self.loss_fun` 在 `__init__` 里被设为：
+
+```python
+if self.loss_type == "BCEWithLogits":
+    self.loss_fun = torch.nn.BCEWithLogitsLoss()
+```
+
+也就是说：
+
+* `discriminator_output` 是 **logit**（还没过 sigmoid 的）
+* `expected` 是标签（0 或 1）
+* `BCEWithLogitsLoss(logit, y)` = 交叉熵：
+  [
+  \text{BCEWithLogits}(z,y) = -\big[ y\log \sigma(z) + (1-y)\log(1-\sigma(z))\big]
+  ]
+
+所以：
+
+* `policy_loss`：希望 policy 样本的判别结果趋近于 0（“假的”）
+* `expert_loss`：希望 expert 样本的判别结果趋近于 1（“真的”）
+
+这就是最普通的 GAN 判别器监督信号。
+
+> 注意：下面 `compute_loss` 里其实又自己写了一遍 expert/policy 的 BCE，不是直接调用上面两个 helper 函数，本质是一样的。
+
+---
+
+### 2.2 `compute_loss`：真正训练判别器时用的是谁？
+
+```python
+def compute_loss(
+    self,
+    policy_d,
+    expert_d,
+    sample_amp_expert,
+    sample_amp_policy,
+    lambda_: float = 10,
+):
+    # 1) 先算 gradient penalty
+    grad_pen_loss = self.compute_grad_pen(
+        expert_states=sample_amp_expert,
+        policy_states=sample_amp_policy,
+        lambda_=lambda_,
+    )
+
+    if self.loss_type == "BCEWithLogits":
+        expert_loss = self.loss_fun(expert_d, torch.ones_like(expert_d))
+        policy_loss = self.loss_fun(policy_d, torch.zeros_like(policy_d))
+        # 判别器的 AMP loss = expert_loss & policy_loss 的平均
+        amp_loss = 0.5 * (expert_loss + policy_loss)
+
+    elif self.loss_type == "Wasserstein":
+        amp_loss = self.wgan_loss(policy_d=policy_d, expert_d=expert_d)
+
+    return amp_loss, grad_pen_loss
+```
+
+这里传进来的：
+
+* `expert_d` = `D(expert_state, expert_next_state)` 的输出 logits / scores
+* `policy_d` = `D(policy_state, policy_next_state)` 的输出 logits / scores
+* `sample_amp_expert` / `sample_amp_policy` 则是 `(state, next_state)` 的 tuple，用于 gradient penalty
+
+#### 2.2.1 BCEWithLogits 模式
+
+* 判别器 loss：
+  [
+  L_{\text{disc}} = \frac{1}{2} \Big( \text{BCE}(D(x_\text{expert}), 1) + \text{BCE}(D(x_\text{policy}), 0) \Big)
+  ]
+
+* Gradient penalty：下面详细讲 `compute_grad_pen`。
+
+* 总判别器 loss（在外面 trainer 里）：通常是
+  [
+  L_{\text{total}} = L_{\text{disc}} + L_{\text{grad-pen}}
+  ]
+
+#### 2.2.2 Wasserstein 模式
+
+如果 `loss_type == "Wasserstein"`：
+
+```python
+def wgan_loss(self, policy_d, expert_d):
+    policy_d = torch.tanh(self.eta_wgan * policy_d)
+    expert_d = torch.tanh(self.eta_wgan * expert_d)
+    return policy_d.mean() - expert_d.mean()
+```
+
+* 原始 WGAN loss 通常是：
+  [
+  L = \mathbb{E}[D(\text{fake})] - \mathbb{E}[D(\text{real})]
+  ]
+  判别器希望 **减小**这个值，也就是让 `D(real)` 大、`D(fake)` 小。
+
+* 这里做了一个改动：先对输出乘以 `eta_wgan` 再过 `tanh` 做压缩：
+
+  * 防止判别器输出发散太大（训练不稳定）
+  * 保持 sign 和相对大小，使得“real > fake”仍然成立
+
+配套的 `compute_grad_pen` 在 Wasserstein 模式下就是 **WGAN-GP**：
+
+```python
+if self.loss_type == "Wasserstein":
+    policy = torch.cat(policy_states, -1)
+    alpha = torch.rand(expert.size(0), 1, device=expert.device)
+    alpha = alpha.expand_as(expert)
+    data = alpha * expert + (1 - alpha) * policy   # 一条插值线上的点
+    data = data.detach().requires_grad_(True)
+    h = self.trunk(data)
+    if self.use_minibatch_std:
+        with torch.no_grad():
+            s = self._minibatch_std_scalar(h)
+        h = torch.cat([h, s], dim=-1)
+    scores = self.linear(h)
+    grad = autograd.grad(
+        outputs=scores,
+        inputs=data,
+        grad_outputs=torch.ones_like(scores),
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+    return lambda_ * (grad.norm(2, dim=1) - 1.0).pow(2).mean()
+```
+
+* 在 expert & policy 之间做插值：
+  [
+  x_\text{interp} = \alpha x_\text{expert} + (1-\alpha)x_\text{policy}
+  ]
+* 算 `∥∇_x D(x_interp)∥_2`，做：
+  [
+  L_{\text{GP}} = \lambda (\lVert \nabla_x D(x)\rVert_2 - 1)^2
+  ]
+  这是 WGAN-GP 里 enforce 1-Lipschitz 的经典方法。
+
+#### 2.2.3 BCE 模式下的 `compute_grad_pen` 是什么？
+
+```python
+elif self.loss_type == "BCEWithLogits":
+    # R1 regularizer on REAL: 0.5 * lambda * ||∇_x D(x_real)||^2
+    data = expert.detach().requires_grad_(True)
+    h = self.trunk(data)
+    if self.use_minibatch_std:
+        with torch.no_grad():
+            s = self._minibatch_std_scalar(h)
+        h = torch.cat([h, s], dim=-1)
+    scores = self.linear(h)
+
+    grad = autograd.grad(
+        outputs=scores.sum(),
+        inputs=data,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+    return 0.5 * lambda_ * (grad.pow(2).sum(dim=1)).mean()
+```
+
+这是 **R1 regularizer**（Mescheder 等人提出的）：
+
+[
+L_{\text{R1}} = \frac{\lambda}{2} \mathbb{E}*{x \sim p*\text{real}} \left[\lVert \nabla_x D(x)\rVert_2^2\right]
+]
+
+作用：
+
+* 惩罚 D 对真实数据附近的梯度过大
+* 平滑判别器，抑制梯度爆炸 & 模式崩塌
+* 对于二分类 BCE 形式的 GAN，R1 是非常常见的正则项
+
+> 注意这里计算 `scores.sum()` 再对 `data` 求导，是因为我们要对 batch 中每个样本的梯度求和再平均，相当于对每个输出都计算一次梯度。
+
+---
+
+## 3. `predict_reward`：给 policy 的 “伪 reward” 怎么来的？
+
+```python
+def predict_reward(self, state, next_state, normalizer=None):
+    with torch.no_grad():
+        if normalizer is not None:
+            state = normalizer(state)
+            next_state = normalizer(next_state)
+
+        discriminator_logit = self.forward(torch.cat([state, next_state], dim=-1))
+
+        if self.loss_type == "Wasserstein":
+            discriminator_logit = torch.tanh(self.eta_wgan * discriminator_logit)
+            return self.reward_scale * torch.exp(discriminator_logit).squeeze()
+
+        # BCE 模式
+        reward = F.softplus(discriminator_logit)
+        reward = self.reward_scale * reward
+        return reward.squeeze()
+```
+
+### 3.1 Wasserstein 模式
+
+* 得到 score `s = D(x)`（再经过 `tanh(eta * s)` 压缩）
+* reward 使用：
+  [
+  r = \text{reward_scale} \cdot e^{\tilde{s}}
+  ]
+  评分越大，reward 越大。
+
+因为 WGAN 中 score 本身就近似 Wasserstein 距离的差，`exp` 做了一个单调放大。
+
+### 3.2 BCE 模式
+
+* `F.softplus(logit)`：
+  softplus(z) = log(1 + e^z)，有一个重要恒等式：
+
+  > `softplus(z) = -log(1 - sigmoid(z))`
+
+  记 (D(x) = \sigma(z))，则
+
+  [
+  \text{softplus}(z) = -\log(1 - D(x))
+  ]
+
+* 这非常像 **GAIL** 里的 reward：
+  标准 GAIL reward 常用：
+  [
+  r(x) = -\log(1 - D(x))
+  \quad \text{或} \quad
+  r(x) = \log D(x) - \log(1 - D(x))
+  ]
+
+* 含义：
+
+  * 如果判别器认为这个样本“很真实”（D(x) 接近 1），则 reward 很大。
+  * 如果 D(x) 接近 0，reward 接近 0。
+
+再乘上 `reward_scale` 做全局缩放。
+这就是 AMP 给 policy 的 **模仿奖励信号**，RL 里的环境 reward 会加上它。
+
+---
+
+## 4. `_minibatch_std_scalar` 到底在干嘛？有什么用？
+
+来看代码：
+
+```python
+def _minibatch_std_scalar(self, h: torch.Tensor) -> torch.Tensor:
+    """Mean over feature-wise std across the batch; shape (B,1)."""
+    if h.shape[0] <= 1:
+        return h.new_zeros((h.shape[0], 1))
+    s = h.float().std(dim=0, unbiased=False).mean()
+    return s.expand(h.shape[0], 1).to(h.dtype)
+```
+
+假设 `h` 的 shape 是 `(B, F)`：
+
+1. `h.std(dim=0)`：对 **batch 维** 求 **每个特征维度的标准差**
+
+   * 得到 `(F,)`：每一列（每个 feature）在整个 batch 上的波动程度
+
+2. `.mean()`：再对这 `F` 个 std 取均值
+
+   * 得到 **一个标量 s**：整个 batch 的“平均多样性”
+
+3. `s.expand(h.shape[0], 1)`：把这个标量复制成 `(B, 1)`，用于给 batch 中每个样本加上同一个额外特征维度
+
+在 `forward` 里使用：
+
+```python
+h = self.trunk(x)               # (B, hidden_dim)
+if self.use_minibatch_std:
+    s = self._minibatch_std_scalar(h)   # (B, 1)
+    h = torch.cat([h, s], dim=-1)       # (B, hidden_dim+1)
+return self.linear(h)
+```
+
+### 4.1 直观理解：它为什么有用？
+
+这个 trick 来自 PGGAN / StyleGAN 的经典设计，叫 **minibatch standard deviation**：
+
+* 判别器不仅看 “单个样本长什么样”，还看 “这一小批样本整体多样性有多大”
+* 如果生成器 collapse（mode collapse），同一个 batch 里很多样本几乎一样 → std 非常小 → s 很小
+* 判别器可以学到：低多样性的 batch 更可能是 **fake**，从而给这类假样本打低分 → 强迫生成器去增加多样性
+
+在这里的 AMP 里也是同理：
+
+* Expert 轨迹采样通常比较多样（各种姿态、速度、环境），batch 中分布较广 → `minibatch std` 较大
+* Policy 初期生成的轨迹比较单一、僵硬 → `minibatch std` 较小
+* 判别器多了一维“整体多样性信息”，能更容易区分 expert / policy
+
+**注意：**
+
+在 `compute_grad_pen` 里使用 `minibatch_std` 时，特意用：
+
+```python
+if self.use_minibatch_std:
+    with torch.no_grad():
+        s = self._minibatch_std_scalar(h)
+    h = torch.cat([h, s], dim=-1)
+```
+
+也就是说 **R1 / WGAN-GP 的 gradient penalty 不允许通过 s 回传梯度**，只对输入 `data` 本身的梯度进行正则化。
+否则，D 会“偷懒”通过动 minibatch 统计去规避 Lipschitz 或 R1 约束，会破坏正则的意义。
+
+---
+
+## 5. 小结（帮你在脑子里建立整体图）
+
+1. **输入**：`x = [state, next_state]`，expert 来的打 label=1，policy 来的 label=0。
+2. **判别器**：MLP(`trunk`) → 可选 `minibatch_std_scalar`（1 维 batch 多样性特征） → `linear` 得到 logit / score。
+3. **训练判别器的 loss：**
+
+   * BCE 模式：
+
+     * 判别器分类 loss：`0.5*(BCE(expert_d,1) + BCE(policy_d,0))`
+     * 正则：R1 regularizer on real data (`0.5*lambda*||∇_x D(x_real)||^2`)
+   * Wasserstein 模式：
+
+     * 判别器 loss：`mean(tanh(eta*policy_d)) - mean(tanh(eta*expert_d))`
+     * 正则：WGAN-GP 插值 gradient penalty
+4. **给 policy 的 adversarial reward：**
+
+   * Wasserstein 模式：`reward ~ exp(tanh(eta * D(x)))`
+   * BCE 模式：`reward ~ softplus(logit) = -log(1 - D(x))`（GAIL 风格）
+5. **`_minibatch_std_scalar`：**
+
+   * 计算“该 batch 在 feature 空间的平均标准差”，作为一维“多样性特征”
+   * 目的是让判别器能发现 **batch 多样性差异**，惩罚 mode collapse，提升区分度
+   * 在 gradient penalty 中对它 `detach`，避免破坏 Lipschitz / R1 约束的意义
+
+---
+
+如果你愿意，下一步我可以帮你：
+
+* 画一个简单的框图（文本版）说明 “expert/policy → D → loss/reward”的数据流。
+* 或者直接结合你 SEAMP / AMP 的训练 loop，帮你标出哪里调用 `compute_loss`、哪里用 `predict_reward`，这样你更容易在自己的项目中 debug。
