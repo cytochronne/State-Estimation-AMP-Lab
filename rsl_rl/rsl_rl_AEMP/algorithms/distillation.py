@@ -142,7 +142,7 @@ class Distillation:
             None,
             self.device,
         )
-
+    
     def act(self, obs, teacher_obs):
         # use the teacher to interact with the environment
         teacher_actions = self.policy.evaluate(teacher_obs).detach()

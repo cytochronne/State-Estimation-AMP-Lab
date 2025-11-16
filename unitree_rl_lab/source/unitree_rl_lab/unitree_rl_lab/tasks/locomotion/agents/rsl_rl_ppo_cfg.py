@@ -88,7 +88,8 @@ class TerrainAwareDistillationAlgorithmCfg(RslRlPpoAlgorithmCfg):
     gradient_length = 15
     num_learning_epochs = 1
     max_grad_norm = 1.0
-    loss_type = "mse"
+    #BCEWithLogits or Wasserstein
+    loss_type = "BCEWithLogits"
     discriminator_cfg = {
         "hidden_layer_sizes": [256, 256],
         "learning_rate": 5.0e-4,
