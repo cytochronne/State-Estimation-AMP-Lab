@@ -20,6 +20,7 @@ from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 from unitree_rl_lab.assets.robots.unitree import UNITREE_GO2_CFG as ROBOT_CFG
 from unitree_rl_lab.tasks.locomotion import mdp
+from unitree_rl_lab.tasks.locomotion.mdp.curriculums import enhanced_terrain_levels_vel
 
 COBBLESTONE_ROAD_CFG = terrain_gen.TerrainGeneratorCfg(
     size=(8.0, 8.0),
@@ -69,12 +70,12 @@ COBBLESTONE_ROAD_CFG = terrain_gen.TerrainGeneratorCfg(
 class RobotSceneCfg(InteractiveSceneCfg):
     """Configuration for the terrain scene with a legged robot."""
 
-    # ground terrain
+    # ground terrain with multi-terrain support
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
         terrain_type="generator",  # "plane", "generator"
         terrain_generator=COBBLESTONE_ROAD_CFG,  # None, ROUGH_TERRAINS_CFG
-        max_init_terrain_level=1,
+        max_init_terrain_level=10,  # 增加最大初始地形级别以支持更广泛的课程
         collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply",
@@ -190,11 +191,11 @@ class CommandsCfg:
 
     base_velocity = mdp.UniformLevelVelocityCommandCfg(
         asset_name="robot",
-        resampling_time_range=(10.0, 10.0),
+        resampling_time_range=(5.0, 10.0),
         rel_standing_envs=0.1,
         debug_vis=True,
         ranges=mdp.UniformLevelVelocityCommandCfg.Ranges(
-            lin_vel_x=(-0.1, 0.1), lin_vel_y=(-0.1, 0.1), ang_vel_z=(-1, 1)
+            lin_vel_x=(-0.8, 0.8), lin_vel_y=(-0.3, 0.3), ang_vel_z=(-1, 1)
         ),
         limit_ranges=mdp.UniformLevelVelocityCommandCfg.Ranges(
             lin_vel_x=(-1.0, 1.0), lin_vel_y=(-0.4, 0.4), ang_vel_z=(-1.0, 1.0)
@@ -364,7 +365,17 @@ class TerminationsCfg:
 class CurriculumCfg:
     """Curriculum terms for the MDP."""
 
-    terrain_levels = CurrTerm(func=mdp.terrain_levels_vel)
+    terrain_levels = CurrTerm(func=enhanced_terrain_levels_vel, params={
+        "success_threshold": 1.0,  # 成功阈值
+        "increase_threshold": 0.9,  # 增加难度的阈值
+        "decrease_threshold": 0.5,  # 降低难度的阈值
+        "increase_steps": 2000,  # 增加难度所需步数
+        "decrease_steps": 500,  # 降低难度所需步数
+        "terrain_type_transition_prob": 0.3,  # 地形类型切换概率
+        "enable_terrain_transition_tracking": True,  # 启用地形切换跟踪
+        "data_save_dir": "./terrain_transition_data",  # 数据保存目录
+        "terrain_transition_buffer_size": 1000  # 缓冲区大小
+    })
     lin_vel_cmd_levels = CurrTerm(mdp.lin_vel_cmd_levels)
 
 
