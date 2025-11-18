@@ -975,3 +975,17 @@ if self.use_minibatch_std:
 
 * 画一个简单的框图（文本版）说明 “expert/policy → D → loss/reward”的数据流。
 * 或者直接结合你 SEAMP / AMP 的训练 loop，帮你标出哪里调用 `compute_loss`、哪里用 `predict_reward`，这样你更容易在自己的项目中 debug。
+
+# save 与 load
+新蒸馏时，加载教师模型，此时会识别这个policy是ac架构的还是ts架构，来判断是不是教师
+在训练时，保存ckpt时，会将该ts（继承自nn.module），保存下来：
+
+self.alg.policy 是一个 nn.Module（如 ActorCritic 或 TerrainAwareStudentTeacher）。
+调用 self.alg.policy.state_dict() 会返回一个字典，键是层名（层级式前缀），值是张量，例如：
+teacher.*（教师网络的编码器/actor/critic权重与缓冲）
+memory_s.*（学生 RNN/LSTM 的权重与状态形状相关缓冲）
+student.encoder.*（学生 MLP 编码器）
+student.policy.*（学生策略头）
+std 或 log_std（动作噪声参数）
+
+resume时就可直接加载训练得到的ckpt，里面包含了教师和学生。

@@ -266,4 +266,3 @@ class TerrainAwareStudentTeacher(nn.Module):
         for param in self.teacher.parameters():
             param.requires_grad_(False)
         return False
-```
