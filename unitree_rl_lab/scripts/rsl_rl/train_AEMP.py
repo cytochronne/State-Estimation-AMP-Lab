@@ -43,6 +43,7 @@ parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy 
 parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
+parser.add_argument("--resume_path", type=str, default=None, help="Path to the model checkpoint to resume training from.")
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -108,7 +109,7 @@ import shutil
 import torch
 from datetime import datetime
 
-from rsl_rl_AEMP.runners import OnPolicyRunner  # TODO: Consider printing the experiment name in the terminal.
+from rsl_rl_AEMP.runners import OnPolicyRunner  
 
 import isaaclab_tasks  # noqa: F401
 from isaaclab.envs import (
@@ -199,7 +200,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # save resume path before creating a new log_dir
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
-        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+        resume_path = args_cli.resume_path
 
     # wrap for video recording
     if args_cli.video:

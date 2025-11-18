@@ -27,9 +27,9 @@ class Distillation:
         learning_rate=1e-3,
         max_grad_norm=None,
         loss_type="mse",
-        device="cpu",
         discriminator_cfg: dict | None = None,
         adv_loss_weight: float = 0.0,
+        device="cpu",
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
     ):
@@ -86,13 +86,13 @@ class Distillation:
         self.learning_rate = learning_rate
         self.max_grad_norm = max_grad_norm
 
-        # initialize the loss function
-        if loss_type == "mse":
-            self.loss_fn = nn.functional.mse_loss
-        elif loss_type == "huber":
-            self.loss_fn = nn.functional.huber_loss
-        else:
-            raise ValueError(f"Unknown loss type: {loss_type}. Supported types are: mse, huber")
+        # # initialize the loss function
+        # if loss_type == "mse":
+        #     self.loss_fn = nn.functional.mse_loss
+        # elif loss_type == "huber":
+        #     self.loss_fn = nn.functional.huber_loss
+        # else:
+        #     raise ValueError(f"Unknown loss type: {loss_type}. Supported types are: mse, huber")
 
         self.num_updates = 0
 

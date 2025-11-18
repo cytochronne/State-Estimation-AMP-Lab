@@ -105,6 +105,7 @@ class TerrainAwareStudentTeacher(nn.Module):
             rnn_type=rnn_type,
             rnn_hidden_dim=rnn_hidden_dim,
             rnn_num_layers=rnn_num_layers,
+            build_critic=False,
         )
         self.teacher.eval()
         for param in self.teacher.parameters():

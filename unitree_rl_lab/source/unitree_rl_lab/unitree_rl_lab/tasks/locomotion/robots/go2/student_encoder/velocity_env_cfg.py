@@ -244,12 +244,12 @@ class ObservationsCfg:
             clip=(-100, 100),
             noise=Gnoise(mean=0.0, std=1.5),
         )
-        joint_effort = ObsTerm(
-            func=mdp.joint_effort,
-            scale=0.01,
-            clip=(-100, 100),
-            noise=Unoise(n_min=-0.01, n_max=0.01),
-        )
+        # #joint_effort = ObsTerm(
+        #     func=mdp.joint_effort,
+        #     scale=0.01,
+        #     clip=(-100, 100),
+        #     noise=Unoise(n_min=-0.01, n_max=0.01),
+        # )
         velocity_commands = ObsTerm(
             func=mdp.generated_commands, clip=(-100, 100), params={"command_name": "base_velocity"}
         )
@@ -276,7 +276,7 @@ class ObservationsCfg:
         )
         joint_pos_rel = ObsTerm(func=mdp.joint_pos_rel, clip=(-100, 100))
         joint_vel_rel = ObsTerm(func=mdp.joint_vel_rel, scale=0.05, clip=(-100, 100))
-        joint_effort = ObsTerm(func=mdp.joint_effort, scale=0.01, clip=(-100, 100))
+        #joint_effort = ObsTerm(func=mdp.joint_effort, scale=0.01, clip=(-100, 100))
         last_action = ObsTerm(func=mdp.last_action, clip=(-100, 100))
         height_scanner = ObsTerm(func=mdp.height_scan,
             params={"sensor_cfg": SceneEntityCfg("height_scanner")},

@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 from isaaclab.utils import configclass
-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, RslRlPpoAlgorithmCfg
+from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, RslRlPpoAlgorithmCfg,RslRlDistillationAlgorithmCfg
 
 
 @configclass
@@ -42,11 +42,11 @@ class BasePPORunnerCfg(RslRlOnPolicyRunnerCfg):
     save_interval = 100
     experiment_name = ""  # same as task name
     empirical_normalization = False
-    obs_groups = {
-        "policy": ["policy"],
-        # optional: you may explicitly set critic; if omitted, resolve_obs_groups() will fill it
-        # "critic": ["critic"],
-    }
+    # obs_groups = {
+    #     "policy": ["policy"],
+    #     # optional: you may explicitly set critic; if omitted, resolve_obs_groups() will fill it
+    #     # "critic": ["critic"],
+    # }
 
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
@@ -82,7 +82,7 @@ class TerrainAwarePPORunnerCfg(BasePPORunnerCfg):
 
 
 @configclass
-class TerrainAwareDistillationAlgorithmCfg(RslRlPpoAlgorithmCfg):
+class TerrainAwareDistillationAlgorithmCfg(RslRlDistillationAlgorithmCfg):
     class_name = "Distillation"
     learning_rate = 5.0e-4
     gradient_length = 15

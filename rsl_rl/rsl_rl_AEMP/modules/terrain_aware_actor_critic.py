@@ -46,6 +46,7 @@ class TerrainAwareActorCritic(nn.Module):
         rnn_type: str = "lstm",
         rnn_hidden_dim: int = 256,
         rnn_num_layers: int = 1,
+        build_critic: bool = True,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -58,24 +59,30 @@ class TerrainAwareActorCritic(nn.Module):
         if height_obs_dim < 0:
             raise ValueError("height_obs_dim must be non-negative.")
 
+        self.build_critic = build_critic
+
         if height_obs_dim == 0:
             self.actor_height_dim = 0
-            self.critic_height_dim = 0
+            critic_height_dim = 0
         elif height_obs_dim >= num_actor_obs or height_obs_dim >= num_critic_obs:
             print(
                 "[WARN] Requested height_obs_dim exceeds available observations. "
                 "Falling back to using all observations without a dedicated terrain encoder."
             )
             self.actor_height_dim = 0
-            self.critic_height_dim = 0
+            critic_height_dim = 0
         else:
             self.actor_height_dim = height_obs_dim
-            self.critic_height_dim = height_obs_dim
+            critic_height_dim = height_obs_dim
         self.actor_core_dim = num_actor_obs - self.actor_height_dim
-        self.critic_core_dim = num_critic_obs - self.critic_height_dim
+        if self.actor_core_dim <= 0:
+            raise ValueError("Actor non-height observation dimension must be positive.")
 
-        if self.actor_core_dim <= 0 or self.critic_core_dim <= 0:
-            raise ValueError("Non-height observation dimensions must be positive.")
+        self.critic_core_dim = num_critic_obs - critic_height_dim if build_critic else 0
+        if build_critic and self.critic_core_dim <= 0:
+            raise ValueError("Critic non-height observation dimension must be positive.")
+
+        self.critic_height_dim = critic_height_dim if build_critic else 0
 
         activation_name = activation
 
@@ -85,23 +92,34 @@ class TerrainAwareActorCritic(nn.Module):
         )
 
         actor_fusion_in_dim = self.actor_core_dim + self.height_embedding_dim
-        critic_fusion_in_dim = self.critic_core_dim + self.height_embedding_dim
+        critic_fusion_in_dim = self.critic_core_dim + self.height_embedding_dim if build_critic else 0
 
         self.actor_fusion_encoder, self.actor_fusion_dim = self._build_fusion_encoder(
             actor_fusion_in_dim, fusion_encoder_dims, activation_name
         )
-        self.critic_fusion_encoder, self.critic_fusion_dim = self._build_fusion_encoder(
-            critic_fusion_in_dim, fusion_encoder_dims, activation_name
-        )
+        if build_critic:
+            self.critic_fusion_encoder, self.critic_fusion_dim = self._build_fusion_encoder(
+                critic_fusion_in_dim, fusion_encoder_dims, activation_name
+            )
+        else:
+            self.critic_fusion_encoder, self.critic_fusion_dim = nn.Identity(), 0
 
         self.actor = self._build_head(self.actor_fusion_dim, actor_hidden_dims, num_actions, activation_name)
-        self.critic = self._build_head(self.critic_fusion_dim, critic_hidden_dims, 1, activation_name)
+        self.critic = (
+            self._build_head(self.critic_fusion_dim, critic_hidden_dims, 1, activation_name)
+            if build_critic
+            else None
+        )
 
         print(f"Terrain encoder CNN: {self.height_encoder}")
         print(f"Actor fusion encoder: {self.actor_fusion_encoder}")
-        print(f"Critic fusion encoder: {self.critic_fusion_encoder}")
-        print(f"Actor head: {self.actor}")
-        print(f"Critic head: {self.critic}")
+        if build_critic:
+            print(f"Critic fusion encoder: {self.critic_fusion_encoder}")
+            print(f"Actor head: {self.actor}")
+            print(f"Critic head: {self.critic}")
+        else:
+            print("Critic disabled for TerrainAwareActorCritic instance.")
+            print(f"Actor head: {self.actor}")
 
         # Action noise configuration
         self.noise_std_type = noise_std_type
@@ -257,6 +275,8 @@ class TerrainAwareActorCritic(nn.Module):
         return self.actor(features)
 
     def evaluate(self, critic_observations, masks=None, hidden_states=None):
+        if self.critic is None:
+            raise RuntimeError("Critic network is disabled for this TerrainAwareActorCritic instance.")
         features = self._prepare_features(critic_observations, self.critic_height_dim, self.critic_fusion_encoder)
         return self.critic(features)
 
@@ -276,5 +296,9 @@ class TerrainAwareActorCritic(nn.Module):
         return self.distribution.entropy().sum(dim=-1)
 
     def load_state_dict(self, state_dict, strict: bool = True):
+        if not self.build_critic:
+            filtered = {k: v for k, v in state_dict.items() if not k.startswith("critic")}
+            super().load_state_dict(filtered, strict=strict)
+            return True
         super().load_state_dict(state_dict, strict=strict)
         return True
