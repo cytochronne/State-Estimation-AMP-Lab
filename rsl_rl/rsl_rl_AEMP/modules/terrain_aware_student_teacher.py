@@ -34,8 +34,8 @@ class TerrainAwareStudentTeacher(nn.Module):
         height_cnn_channels: Sequence[int] = (16, 32),
         height_map_shape: Tuple[int, int] | None = None,
         height_encoder_dims: Sequence[int] | None = None,
-        teacher_actor_hidden_dims: Sequence[int] = (256, 256, 256),
-        teacher_critic_hidden_dims: Sequence[int] = (256, 256, 256),
+        teacher_actor_hidden_dims: Sequence[int] = (512, 256, 128),
+        teacher_critic_hidden_dims: Sequence[int] = (512, 256, 128),
         student_encoder_hidden_dims: Sequence[int] | None = None,
         student_policy_hidden_dims: Sequence[int] = (256, 256, 256),
         activation: str = "elu",
@@ -105,7 +105,7 @@ class TerrainAwareStudentTeacher(nn.Module):
             rnn_type=rnn_type,
             rnn_hidden_dim=rnn_hidden_dim,
             rnn_num_layers=rnn_num_layers,
-            build_critic=False,
+            build_critic=True,
         )
         self.teacher.eval()
         for param in self.teacher.parameters():

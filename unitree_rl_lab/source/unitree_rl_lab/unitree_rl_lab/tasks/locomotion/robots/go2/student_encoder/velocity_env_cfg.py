@@ -287,7 +287,7 @@ class ObservationsCfg:
             #self.history_length = 5
 
     # privileged observations
-    critic: CriticCfg = CriticCfg()
+    teacher: CriticCfg = CriticCfg()
 
 
 @configclass
