@@ -2,6 +2,7 @@ import math
 
 import isaaclab.sim as sim_utils
 import isaaclab.terrains as terrain_gen
+import numpy as np
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
@@ -65,6 +66,54 @@ COBBLESTONE_ROAD_CFG = terrain_gen.TerrainGeneratorCfg(
     },
 )
 
+MIXED_STITCHED_TERRAINS_CFG = terrain_gen.TerrainGeneratorCfg(
+    size=(8.0, 8.0),
+    border_width=20.0,
+    num_rows=8,
+    num_cols=8,
+    horizontal_scale=0.1,
+    vertical_scale=0.005,
+    slope_threshold=0.75,
+    difficulty_range=(0.0, 1.0),
+    use_cache=False,
+    sub_terrains={
+        "stitched": terrain_gen.SubTerrainBaseCfg(
+            function=lambda difficulty, cfg: stitched_multi_terrain(difficulty, cfg),
+            proportion=1.0,
+            size=(8.0, 8.0),
+        ),
+    },
+)
+
+def stitched_multi_terrain(difficulty, cfg):
+    seg_ratios = [0.25, 0.25, 0.25, 0.25]
+    seg_cfgs = [
+        terrain_gen.MeshPlaneTerrainCfg(),
+        terrain_gen.MeshRandomGridTerrainCfg(grid_width=0.45, grid_height_range=(0.05, 0.2), platform_width=2.0),
+        terrain_gen.HfPyramidSlopedTerrainCfg(slope_range=(0.0, 0.4), platform_width=2.0, border_width=0.25),
+        terrain_gen.MeshPyramidStairsTerrainCfg(step_height_range=(0.05, 0.23), step_width=0.3, platform_width=3.0, border_width=1.0, holes=False),
+    ]
+    meshes_out = []
+    x_cursor = 0.0
+    first_origin = None
+    for ratio, base_cfg in zip(seg_ratios, seg_cfgs):
+        seg_w = cfg.size[0] * ratio
+        seg_size = (seg_w, cfg.size[1])
+        seg_cfg = base_cfg.replace(size=seg_size, proportion=1.0)
+        seg_meshes, seg_origin = seg_cfg.function(difficulty, seg_cfg)
+        if first_origin is None:
+            first_origin = np.array(seg_origin, dtype=float)
+        if seg_meshes:
+            transform = np.eye(4)
+            transform[0, -1] = x_cursor
+            for m in seg_meshes:
+                m.apply_transform(transform)
+            meshes_out.extend(seg_meshes)
+        x_cursor += seg_w
+    if first_origin is None:
+        first_origin = np.zeros(3, dtype=float)
+    return meshes_out, first_origin
+
 
 @configclass
 class RobotSceneCfg(InteractiveSceneCfg):
@@ -74,7 +123,7 @@ class RobotSceneCfg(InteractiveSceneCfg):
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
         terrain_type="generator",  # "plane", "generator"
-        terrain_generator=COBBLESTONE_ROAD_CFG,  # None, ROUGH_TERRAINS_CFG
+        terrain_generator=MIXED_STITCHED_TERRAINS_CFG,  # None, ROUGH_TERRAINS_CFG
         max_init_terrain_level=1,
         collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(
