@@ -100,6 +100,7 @@ class OnPolicyRunner:
         if self.training_type == "distillation":
             discriminator_cfg = alg_cfg.pop("discriminator_cfg", None)
             adv_loss_weight = alg_cfg.pop("adv_loss_weight", 0.0)
+            print("INFO:multi_gpu_cfg=", self.multi_gpu_cfg)
             self.alg: PPO | Distillation = alg_class(
                 policy,
                 device=self.device,
@@ -112,6 +113,7 @@ class OnPolicyRunner:
             # remove discriminator-specific arguments if present due to shared configs
             alg_cfg.pop("discriminator_cfg", None)
             alg_cfg.pop("adv_loss_weight", None)
+            print("INFO:multi_gpu_cfg=", self.multi_gpu_cfg)
             self.alg: PPO | Distillation = alg_class(
                 policy, device=self.device, **alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg
             )
@@ -339,7 +341,10 @@ class OnPolicyRunner:
                     self.writer.add_scalar("Episode/" + key, value, locs["it"])
                     ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
 
-        mean_std = self.alg.policy.action_std.mean()
+        if hasattr(self.alg.policy, "action_std"):
+            mean_std = self.alg.policy.action_std.mean()
+        else:
+            mean_std = torch.tensor(0.0)
         fps = int(collection_size / (locs["collection_time"] + locs["learn_time"]))
 
         # -- Losses

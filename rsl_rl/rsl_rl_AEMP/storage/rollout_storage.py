@@ -170,7 +170,7 @@ class RolloutStorage:
     def generator(self):
         if self.training_type != "distillation":
             raise ValueError("This function is only available for distillation training.")
-
+        #privileged_observations.shape =  [num_transitions_per_env, num_envs, obs_shape]
         for i in range(self.num_transitions_per_env):
             if self.privileged_observations is not None:
                 privileged_observations = self.privileged_observations[i]

@@ -145,5 +145,9 @@ class Discriminator(nn.Module):
     def _minibatch_std_scalar(self, h: torch.Tensor) -> torch.Tensor:
         if h.shape[0] <= 1:
             return h.new_zeros((h.shape[0], 1))
-        std = h.float().std(dim=0, unbiased=False).mean()
-        return std.expand(h.shape[0], 1).to(h.dtype)
+        h_float = h.float()
+        # add epsilon to avoid zero std which would trigger NaNs during backward
+        variance = h_float.var(dim=0, unbiased=False)
+        std = torch.sqrt(variance + 1.0e-6)
+        std_mean = std.mean()
+        return std_mean.expand(h.shape[0], 1).to(h.dtype)

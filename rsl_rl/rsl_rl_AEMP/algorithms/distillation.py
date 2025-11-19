@@ -166,8 +166,8 @@ class Distillation:
         self.num_updates += 1
         mean_adv_loss = 0.0
         mean_disc_loss = 0.0
-        loss = 0.0
-        cnt = 0
+        # count how many generator backward passes accumulated since last step
+        accum_cnt = 0
         adv_cnt = 0
         disc_cnt = 0
 
@@ -179,6 +179,7 @@ class Distillation:
             for obs, privileged_obs, _, privileged_actions, dones in self.storage.generator():
 
                 # compute student and teacher latents
+                
                 student_latent = self.policy.get_student_latent(obs)
                 total_loss = 0.0
 
@@ -212,37 +213,41 @@ class Distillation:
                         mean_adv_loss += adv_loss.item()
                         adv_cnt += 1
 
-                # total loss
-                loss = loss + total_loss
-                if total_loss != 0.0:
-                    cnt += 1
-
-                # gradient step
-                if cnt > 0 and cnt % self.gradient_length == 0:
-                    self.optimizer.zero_grad()
-                    loss.backward()
-                    if self.is_multi_gpu:
-                        self.reduce_parameters(self.encoder_parameters)
-                    if self.max_grad_norm:
-                        nn.utils.clip_grad_norm_(self.encoder_parameters, self.max_grad_norm)
-                    self.optimizer.step()
-                    self.policy.detach_hidden_states()
-                    loss = 0.0
+                # perform immediate backward for generator loss to avoid stale
+                # references to discriminator parameters across its updates
+                if torch.is_tensor(total_loss):
+                    if accum_cnt == 0:
+                        self.optimizer.zero_grad()
+                    next_accum_cnt = accum_cnt + 1
+                    retain_graph = (
+                        self.gradient_length is not None
+                        and self.gradient_length > 1
+                        and (next_accum_cnt % self.gradient_length) != 0
+                    )
+                    total_loss.backward(retain_graph=retain_graph)
+                    accum_cnt = next_accum_cnt
+                    # perform optimizer step based on gradient length
+                    if accum_cnt % self.gradient_length == 0:
+                        if self.is_multi_gpu:
+                            self.reduce_parameters(self.encoder_parameters)
+                        if self.max_grad_norm:
+                            nn.utils.clip_grad_norm_(self.encoder_parameters, self.max_grad_norm)
+                        self.optimizer.step()
+                        self.policy.detach_hidden_states()
+                        accum_cnt = 0
 
                 # reset dones
                 self.policy.reset(dones.view(-1))
                 self.policy.detach_hidden_states(dones.view(-1))
 
-        if cnt > 0 and loss != 0.0:
-            self.optimizer.zero_grad()
-            loss.backward()
+        # flush remaining accumulated gradients
+        if accum_cnt > 0:
             if self.is_multi_gpu:
                 self.reduce_parameters(self.encoder_parameters)
             if self.max_grad_norm:
                 nn.utils.clip_grad_norm_(self.encoder_parameters, self.max_grad_norm)
             self.optimizer.step()
             self.policy.detach_hidden_states()
-            loss = 0.0
 
         if self.discriminator is not None and adv_cnt > 0:
             mean_adv_loss /= adv_cnt

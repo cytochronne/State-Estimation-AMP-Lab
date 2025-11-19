@@ -108,7 +108,7 @@ import os
 import shutil
 import torch
 from datetime import datetime
-
+torch.autograd.set_detect_anomaly(True)
 from rsl_rl_AEMP.runners import OnPolicyRunner  
 
 import isaaclab_tasks  # noqa: F401
