@@ -9,6 +9,7 @@ import os
 import statistics
 import time
 import torch
+import math
 from collections import deque
 
 import rsl_rl
@@ -348,12 +349,57 @@ class OnPolicyRunner:
             # everything else
             self.writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
             self.writer.add_scalar("Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"])
+
             if self.logger_type != "wandb":  # wandb does not support non-integer x-axis logging
                 self.writer.add_scalar("Train/mean_reward/time", statistics.mean(locs["rewbuffer"]), self.tot_time)
                 self.writer.add_scalar(
                     "Train/mean_episode_length/time", statistics.mean(locs["lenbuffer"]), self.tot_time
                 )
-
+        # 添加平均成功率监控
+        if locs['ep_infos']:
+            # 统计成功的episode数量
+            success_count = 0
+            total_count = 0
+            for ep_info in locs['ep_infos']:
+                total_count += 1
+                # 检查是否有success字段，如果有且为True，则计为成功
+                if 'success' in ep_info and (ep_info['success'] if not isinstance(ep_info['success'], torch.Tensor) else ep_info['success'].item()):
+                    success_count += 1
+            
+            if total_count > 0:
+                success_rate = success_count / total_count
+                self.writer.add_scalar('Train/success_rate', success_rate, locs['it'])
+                self.writer.add_scalar('Train/success_rate/time', success_rate, self.tot_time)
+        
+        # 添加线速度追踪准确度监控指标（0-1范围）
+        try:
+            # 获取命令管理器中的基础速度命令
+            command_term = self.env.command_manager.get_term('base_velocity')
+            
+            # 获取实际线速度（从机器人状态获取）
+            actual_lin_vel = self.env.robot.data.base_lin_vel[:, :2]  # 获取x和y方向的线速度
+            
+            # 获取期望线速度（从命令中获取）
+            desired_lin_vel = command_term.command[:, :2]  # 获取x和y方向的期望速度
+            
+            # 计算速度误差的平方和
+            velocity_error = torch.sum(torch.square(actual_lin_vel - desired_lin_vel), dim=1)
+            
+            # 使用与奖励函数相同的参数计算准确度（参考track_lin_vel_xy_exp）
+            std = math.sqrt(0.25)  # 与配置文件中的std保持一致
+            lin_vel_accuracy = torch.exp(-velocity_error / (std ** 2))
+            
+            # 计算平均准确度
+            avg_lin_vel_accuracy = torch.mean(lin_vel_accuracy).item()
+            
+            # 记录到wandb
+            self.writer.add_scalar('Metrics/lin_vel_tracking_accuracy', avg_lin_vel_accuracy, locs['it'])
+            self.writer.add_scalar('Metrics/lin_vel_tracking_accuracy/time', avg_lin_vel_accuracy, self.tot_time)
+            
+        except Exception as e:
+            # 如果计算过程中出现错误，记录但不中断训练
+            print(f"Error calculating linear velocity tracking accuracy: {e}")
+                
         str = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
 
         if len(locs["rewbuffer"]) > 0:

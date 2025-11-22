@@ -34,8 +34,8 @@ class WandbSummaryWriter(SummaryWriter):
         except KeyError:
             entity = None
 
-        # Initialize wandb
-        wandb.init(project=project, entity=entity, name=run_name)
+        # Initialize wandb in offline mode
+        wandb.init(project=project, entity=entity, name=run_name, mode="offline")
 
         # Add log directory to wandb
         wandb.config.update({"log_dir": log_dir})
@@ -62,7 +62,9 @@ class WandbSummaryWriter(SummaryWriter):
             walltime=walltime,
             new_style=new_style,
         )
-        wandb.log({self._map_path(tag): scalar_value}, step=global_step)
+        # 确保step参数是整数类型
+        step = int(global_step) if global_step is not None else None
+        wandb.log({self._map_path(tag): scalar_value}, step=step)
 
     def stop(self):
         wandb.finish()
