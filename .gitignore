@@ -21,6 +21,7 @@ unitree_model/
 
 # System
 .DS_Store
+/IsaacLab
 
 *.sh
 DevelopNot.md
