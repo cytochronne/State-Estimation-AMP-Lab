@@ -66,24 +66,6 @@ COBBLESTONE_ROAD_CFG = terrain_gen.TerrainGeneratorCfg(
 )
 
 STITCHED_2x2_TERRAINS_SIZE = (6.0, 6.0)
-STITCHED_2x2_TERRAINS_CFG = terrain_gen.TerrainGeneratorCfg(
-    size=STITCHED_2x2_TERRAINS_SIZE,
-    border_width=2.0,
-    num_rows=10,
-    num_cols=20,
-    horizontal_scale=0.1,
-    vertical_scale=0.005,
-    slope_threshold=0.75,
-    difficulty_range=(0.0, 1.0),
-    use_cache=False,
-    sub_terrains={
-        "stitched_2x2": terrain_gen.SubTerrainBaseCfg(
-            function=lambda difficulty, cfg: stitched_2x2(difficulty, cfg),
-            proportion=1.0,
-            size=STITCHED_2x2_TERRAINS_SIZE,
-        ),
-    },
-)
 
 def stitched_2x2(difficulty, cfg):
     STITCH_SEAM_OVERLAP = 0.0
@@ -120,6 +102,24 @@ def stitched_2x2(difficulty, cfg):
         first_origin = np.zeros(3, dtype=float)
     return meshes_out, first_origin
 
+STITCHED_2x2_TERRAINS_CFG = terrain_gen.TerrainGeneratorCfg(
+    size=STITCHED_2x2_TERRAINS_SIZE,
+    border_width=2.0,
+    num_rows=10,
+    num_cols=20,
+    horizontal_scale=0.1,
+    vertical_scale=0.005,
+    slope_threshold=0.75,
+    difficulty_range=(0.0, 1.0),
+    use_cache=False,
+    sub_terrains={
+        "stitched_2x2": terrain_gen.SubTerrainBaseCfg(
+            function=stitched_2x2,
+            proportion=1.0,
+            size=STITCHED_2x2_TERRAINS_SIZE,
+        ),
+    },
+)
 @configclass
 class RobotSceneCfg(InteractiveSceneCfg):
     """Configuration for the terrain scene with a legged robot."""
