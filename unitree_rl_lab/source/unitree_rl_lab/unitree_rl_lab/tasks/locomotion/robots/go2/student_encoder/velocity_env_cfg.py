@@ -293,12 +293,12 @@ class ObservationsCfg:
             clip=(-100, 100),
             noise=Gnoise(mean=0.0, std=1.5),
         )
-        # #joint_effort = ObsTerm(
-        #     func=mdp.joint_effort,
-        #     scale=0.01,
-        #     clip=(-100, 100),
-        #     noise=Unoise(n_min=-0.01, n_max=0.01),
-        # )
+        joint_effort = ObsTerm(
+            func=mdp.joint_effort,
+            scale=0.01,
+            clip=(-100, 100),
+            noise=Unoise(n_min=-0.01, n_max=0.01),
+        )
         velocity_commands = ObsTerm(
             func=mdp.generated_commands, clip=(-100, 100), params={"command_name": "base_velocity"}
         )

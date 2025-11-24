@@ -94,7 +94,7 @@ class TerrainAwareDistillationAlgorithmCfg(RslRlDistillationAlgorithmCfg):
         "hidden_layer_sizes": [256, 256],
         "learning_rate": 5.0e-4,
         "use_minibatch_std": True,
-        "grad_penalty_lambda": 10.0,
+        "grad_penalty_lambda": 0.0,
     }
     adv_loss_weight = 1.0
 

@@ -166,6 +166,8 @@ class Distillation:
         self.num_updates += 1
         mean_adv_loss = 0.0
         mean_disc_loss = 0.0
+        mean_student_score = 0.0
+        mean_teacher_score = 0.0
         # count how many generator backward passes accumulated since last step
         accum_cnt = 0
         adv_cnt = 0
@@ -186,6 +188,9 @@ class Distillation:
                 if self.discriminator is not None:
                     with torch.no_grad():
                         teacher_latent = self.policy.evaluate_feature(privileged_obs)
+                        # Log scores
+                        mean_student_score += self.discriminator.classify(student_latent).mean().item()
+                        mean_teacher_score += self.discriminator.classify(teacher_latent).mean().item()
 
                     disc_loss_value = 0.0
                     for _ in range(self.discriminator_updates):
@@ -253,6 +258,8 @@ class Distillation:
             mean_adv_loss /= adv_cnt
         if self.discriminator is not None and disc_cnt > 0:
             mean_disc_loss /= disc_cnt
+            mean_student_score /= disc_cnt
+            mean_teacher_score /= disc_cnt
         self.storage.clear()
         self.last_hidden_states = self.policy.get_hidden_states()
         self.policy.detach_hidden_states()
@@ -264,6 +271,8 @@ class Distillation:
                 loss_dict["adv"] = mean_adv_loss
             if disc_cnt > 0:
                 loss_dict["disc"] = mean_disc_loss
+                loss_dict["student_score"] = mean_student_score
+                loss_dict["teacher_score"] = mean_teacher_score
 
         return loss_dict
 
