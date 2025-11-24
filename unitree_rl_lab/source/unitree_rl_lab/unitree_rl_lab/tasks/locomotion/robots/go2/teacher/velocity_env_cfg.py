@@ -2,6 +2,7 @@ import math
 
 import isaaclab.sim as sim_utils
 import isaaclab.terrains as terrain_gen
+import numpy as np
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
@@ -64,6 +65,60 @@ COBBLESTONE_ROAD_CFG = terrain_gen.TerrainGeneratorCfg(
     },
 )
 
+STITCHED_2x2_TERRAINS_SIZE = (6.0, 6.0)
+STITCHED_2x2_TERRAINS_CFG = terrain_gen.TerrainGeneratorCfg(
+    size=STITCHED_2x2_TERRAINS_SIZE,
+    border_width=2.0,
+    num_rows=10,
+    num_cols=20,
+    horizontal_scale=0.1,
+    vertical_scale=0.005,
+    slope_threshold=0.75,
+    difficulty_range=(0.0, 1.0),
+    use_cache=False,
+    sub_terrains={
+        "stitched_2x2": terrain_gen.SubTerrainBaseCfg(
+            function=lambda difficulty, cfg: stitched_2x2(difficulty, cfg),
+            proportion=1.0,
+            size=STITCHED_2x2_TERRAINS_SIZE,
+        ),
+    },
+)
+
+def stitched_2x2(difficulty, cfg):
+    STITCH_SEAM_OVERLAP = 0.0
+    quad_size = (cfg.size[0] / 2.0, cfg.size[1] / 2.0)
+    STITCH_PLATFORM_FRACTION = 0.25
+    platform_w = STITCH_PLATFORM_FRACTION * min(quad_size)
+    base_cfgs = [
+        terrain_gen.HfRandomUniformTerrainCfg(noise_range=(0.01, 0.06), noise_step=0.01, border_width=0.0),
+        terrain_gen.HfPyramidSlopedTerrainCfg(slope_range=(0.0, 0.4), platform_width=platform_w, border_width=0.0),
+        terrain_gen.MeshRandomGridTerrainCfg(grid_width=0.45, grid_height_range=(0.05, 0.2), platform_width=platform_w),
+        terrain_gen.MeshPyramidStairsTerrainCfg(step_height_range=(0.05, 0.23), step_width=0.3, platform_width=platform_w, border_width=0.0, holes=False),
+    ]
+    offsets = [
+        (0.0, 0.0),
+        (0.0, quad_size[1] - STITCH_SEAM_OVERLAP),
+        (quad_size[0] - STITCH_SEAM_OVERLAP, quad_size[1] - STITCH_SEAM_OVERLAP),
+        (quad_size[0] - STITCH_SEAM_OVERLAP, 0.0),
+    ]
+    meshes_out = []
+    first_origin = None
+    for base_cfg, (ox, oy) in zip(base_cfgs, offsets):
+        seg_cfg = base_cfg.replace(size=quad_size, proportion=1.0)
+        seg_meshes, seg_origin = seg_cfg.function(difficulty, seg_cfg)
+        if first_origin is None:
+            first_origin = np.array(seg_origin, dtype=float)
+        for m in seg_meshes:
+            m_copy = m.copy()
+            T = np.eye(4)
+            T[0, -1] = ox
+            T[1, -1] = oy
+            m_copy.apply_transform(T)
+            meshes_out.append(m_copy)
+    if first_origin is None:
+        first_origin = np.zeros(3, dtype=float)
+    return meshes_out, first_origin
 
 @configclass
 class RobotSceneCfg(InteractiveSceneCfg):
@@ -73,7 +128,7 @@ class RobotSceneCfg(InteractiveSceneCfg):
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
         terrain_type="generator",  # "plane", "generator"
-        terrain_generator=COBBLESTONE_ROAD_CFG,  # None, ROUGH_TERRAINS_CFG
+        terrain_generator=STITCHED_2x2_TERRAINS_CFG,  # None, ROUGH_TERRAINS_CFG
         max_init_terrain_level=10,  # 增加最大初始地形级别以支持更广泛的课程
         collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(
@@ -280,6 +335,9 @@ class RewardsCfg:
     )
     track_ang_vel_z = RewTerm(
         func=mdp.track_ang_vel_z_exp, weight=0.75, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
+    )
+    vel_tracking_success = RewTerm(
+        func=mdp.vel_tracking_success, weight=1.0, params={"command_name": "base_velocity", "lin_thresh": 0.1}
     )
 
     # -- base
