@@ -223,3 +223,15 @@ def joint_mirror(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, mirror_joint
         )
     reward *= 1 / len(mirror_joints) if len(mirror_joints) > 0 else 0
     return reward
+
+
+def vel_tracking_success(
+    env: ManagerBasedRLEnv,
+    command_name: str = "base_velocity",
+    lin_thresh: float = 0.1,
+) -> torch.Tensor:
+    asset: Articulation = env.scene["robot"]
+    cmd_b = env.command_manager.get_command(command_name)
+    vel_b = asset.data.root_lin_vel_b[:, :2]
+    err = torch.linalg.norm(vel_b - cmd_b[:, :2], dim=1)
+    return (err < lin_thresh).float()

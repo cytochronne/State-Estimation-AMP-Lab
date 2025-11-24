@@ -65,51 +65,57 @@ COBBLESTONE_ROAD_CFG = terrain_gen.TerrainGeneratorCfg(
         ),
     },
 )
-
-MIXED_STITCHED_TERRAINS_CFG = terrain_gen.TerrainGeneratorCfg(
-    size=(8.0, 8.0),
-    border_width=20.0,
-    num_rows=8,
-    num_cols=8,
+STITCHED_2x2_TERRAINS_SIZE = (6.0, 6.0)
+STITCHED_2x2_TERRAINS_CFG = terrain_gen.TerrainGeneratorCfg(
+    size=STITCHED_2x2_TERRAINS_SIZE,
+    border_width=2.0,
+    num_rows=10,
+    num_cols=20,
     horizontal_scale=0.1,
     vertical_scale=0.005,
     slope_threshold=0.75,
     difficulty_range=(0.0, 1.0),
     use_cache=False,
     sub_terrains={
-        "stitched": terrain_gen.SubTerrainBaseCfg(
-            function=lambda difficulty, cfg: stitched_multi_terrain(difficulty, cfg),
+        "stitched_2x2": terrain_gen.SubTerrainBaseCfg(
+            function=lambda difficulty, cfg: stitched_2x2(difficulty, cfg),
             proportion=1.0,
-            size=(8.0, 8.0),
+            size=STITCHED_2x2_TERRAINS_SIZE,
         ),
     },
 )
 
-def stitched_multi_terrain(difficulty, cfg):
-    seg_ratios = [0.25, 0.25, 0.25, 0.25]
-    seg_cfgs = [
-        terrain_gen.MeshPlaneTerrainCfg(),
-        terrain_gen.MeshRandomGridTerrainCfg(grid_width=0.45, grid_height_range=(0.05, 0.2), platform_width=2.0),
-        terrain_gen.HfPyramidSlopedTerrainCfg(slope_range=(0.0, 0.4), platform_width=2.0, border_width=0.25),
-        terrain_gen.MeshPyramidStairsTerrainCfg(step_height_range=(0.05, 0.23), step_width=0.3, platform_width=3.0, border_width=1.0, holes=False),
+def stitched_2x2(difficulty, cfg):
+    STITCH_SEAM_OVERLAP = 0.0
+    quad_size = (cfg.size[0] / 2.0, cfg.size[1] / 2.0)
+    STITCH_PLATFORM_FRACTION = 0.25
+    platform_w = STITCH_PLATFORM_FRACTION * min(quad_size)
+    base_cfgs = [
+        terrain_gen.HfRandomUniformTerrainCfg(noise_range=(0.01, 0.06), noise_step=0.01, border_width=0.0),
+        terrain_gen.HfPyramidSlopedTerrainCfg(slope_range=(0.0, 0.4), platform_width=platform_w, border_width=0.0),
+        terrain_gen.MeshRandomGridTerrainCfg(grid_width=0.45, grid_height_range=(0.05, 0.2), platform_width=platform_w),
+        terrain_gen.MeshPyramidStairsTerrainCfg(step_height_range=(0.05, 0.23), step_width=0.3, platform_width=platform_w, border_width=0.0, holes=False),
+    ]
+    offsets = [
+        (0.0, 0.0),
+        (0.0, quad_size[1] - STITCH_SEAM_OVERLAP),
+        (quad_size[0] - STITCH_SEAM_OVERLAP, quad_size[1] - STITCH_SEAM_OVERLAP),
+        (quad_size[0] - STITCH_SEAM_OVERLAP, 0.0),
     ]
     meshes_out = []
-    x_cursor = 0.0
     first_origin = None
-    for ratio, base_cfg in zip(seg_ratios, seg_cfgs):
-        seg_w = cfg.size[0] * ratio
-        seg_size = (seg_w, cfg.size[1])
-        seg_cfg = base_cfg.replace(size=seg_size, proportion=1.0)
+    for base_cfg, (ox, oy) in zip(base_cfgs, offsets):
+        seg_cfg = base_cfg.replace(size=quad_size, proportion=1.0)
         seg_meshes, seg_origin = seg_cfg.function(difficulty, seg_cfg)
         if first_origin is None:
             first_origin = np.array(seg_origin, dtype=float)
-        if seg_meshes:
-            transform = np.eye(4)
-            transform[0, -1] = x_cursor
-            for m in seg_meshes:
-                m.apply_transform(transform)
-            meshes_out.extend(seg_meshes)
-        x_cursor += seg_w
+        for m in seg_meshes:
+            m_copy = m.copy()
+            T = np.eye(4)
+            T[0, -1] = ox
+            T[1, -1] = oy
+            m_copy.apply_transform(T)
+            meshes_out.append(m_copy)
     if first_origin is None:
         first_origin = np.zeros(3, dtype=float)
     return meshes_out, first_origin
@@ -123,7 +129,7 @@ class RobotSceneCfg(InteractiveSceneCfg):
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
         terrain_type="generator",  # "plane", "generator"
-        terrain_generator=MIXED_STITCHED_TERRAINS_CFG,  # None, ROUGH_TERRAINS_CFG
+        terrain_generator=STITCHED_2x2_TERRAINS_CFG,  # None, ROUGH_TERRAINS_CFG
         max_init_terrain_level=1,
         collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(
@@ -240,14 +246,14 @@ class CommandsCfg:
 
     base_velocity = mdp.UniformLevelVelocityCommandCfg(
         asset_name="robot",
-        resampling_time_range=(10.0, 10.0),
+        resampling_time_range=(5.0, 10.0),
         rel_standing_envs=0.1,
         debug_vis=True,
         ranges=mdp.UniformLevelVelocityCommandCfg.Ranges(
-            lin_vel_x=(-0.1, 0.1), lin_vel_y=(-0.1, 0.1), ang_vel_z=(-1, 1)
+            lin_vel_x=(-2.0, 2.0), lin_vel_y=(-0.4, 0.4), ang_vel_z=(-1.0, 1.0)
         ),
         limit_ranges=mdp.UniformLevelVelocityCommandCfg.Ranges(
-            lin_vel_x=(-1.0, 1.0), lin_vel_y=(-0.4, 0.4), ang_vel_z=(-1.0, 1.0)
+            lin_vel_x=(-2.0, 2.0), lin_vel_y=(-0.4, 0.4), ang_vel_z=(-1.0, 1.0)
         ),
     )
 
@@ -349,6 +355,9 @@ class RewardsCfg:
     )
     track_ang_vel_z = RewTerm(
         func=mdp.track_ang_vel_z_exp, weight=0.75, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
+    )
+    vel_tracking_success = RewTerm(
+        func=mdp.vel_tracking_success, weight=1.0, params={"command_name": "base_velocity", "lin_thresh": 0.1}
     )
 
     # -- base

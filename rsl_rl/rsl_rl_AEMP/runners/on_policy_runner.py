@@ -376,6 +376,48 @@ class OnPolicyRunner:
                     "Train/mean_episode_length/time", statistics.mean(locs["lenbuffer"]), self.tot_time
                 )
 
+            try:
+                reward_manager = getattr(self.env, "reward_manager", None)
+                # Episode length in steps
+                max_len = getattr(self.env, "max_episode_length", None)
+                if isinstance(max_len, torch.Tensor):
+                    max_len = float(max_len.mean().item())
+                elif max_len is not None:
+                    max_len = float(max_len)
+
+                def _normalized_accuracy(term_name: str):
+                    if reward_manager is None:
+                        return None
+                    sums_map = getattr(reward_manager, "_episode_sums", {})
+                    if term_name not in sums_map or max_len is None:
+                        return None
+                    term_sums = sums_map[term_name]
+                    mean_sum = term_sums.mean()
+                    term_cfg = reward_manager.get_term_cfg(term_name)
+                    weight = float(abs(getattr(term_cfg, "weight", 1.0)))
+                    if weight <= 0.0:
+                        return None
+                    acc = (mean_sum / max_len) / weight
+                    if hasattr(acc, "clamp"):
+                        acc = acc.clamp(0.0, 1.0)
+                        return float(acc.item())
+                    return float(max(0.0, min(1.0, acc)))
+
+                acc_lin = _normalized_accuracy("track_lin_vel_xy")
+                acc_ang = _normalized_accuracy("track_ang_vel_z")
+                if acc_lin is not None:
+                    self.writer.add_scalar("VelTracking/accuracy_lin_xy", acc_lin, locs["it"])
+                if acc_ang is not None:
+                    self.writer.add_scalar("VelTracking/accuracy_ang_z", acc_ang, locs["it"])
+                if reward_manager is not None and max_len is not None:
+                    sums_map = getattr(reward_manager, "_episode_sums", {})
+                    if "vel_tracking_success" in sums_map:
+                        success_mean = sums_map["vel_tracking_success"].mean()
+                        succ_rate = float((success_mean / max_len).clamp(0.0, 1.0).item())
+                        self.writer.add_scalar("VelTracking/success_rate", succ_rate, locs["it"])
+            except Exception:
+                pass
+
         str = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
 
         if len(locs["rewbuffer"]) > 0:
