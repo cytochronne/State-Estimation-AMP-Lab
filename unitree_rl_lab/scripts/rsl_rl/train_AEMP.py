@@ -238,7 +238,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         inspect.getfile(env_cfg.__class__),
         os.path.join(log_dir, "params", os.path.basename(inspect.getfile(env_cfg.__class__))),
     )
-
+    
     
 
     # run training

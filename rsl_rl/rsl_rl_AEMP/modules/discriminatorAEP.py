@@ -47,7 +47,7 @@ class Discriminator(nn.Module):
         curr_in_dim = input_dim
         for hidden_dim in hidden_layer_sizes:
             layers.append(nn.Linear(curr_in_dim, hidden_dim))
-            layers.append(nn.ReLU())
+            layers.append(nn.LeakyReLU())
             curr_in_dim = hidden_dim
         self.trunk = nn.Sequential(*layers)
 
@@ -65,15 +65,19 @@ class Discriminator(nn.Module):
         """Return discriminator logits for the provided latent vectors."""
 
         h = self.trunk(latent)
-        if self.use_minibatch_std:
-            std_feat = self._minibatch_std_scalar(h)
-            h = torch.cat([h, std_feat], dim=-1)
+        #print(f"[DEBUG] Discriminator trunk output: {h}")
+        # if self.use_minibatch_std:
+        #     std_feat = self._minibatch_std_scalar(h)
+        #     #print(f"[DEBUG] Discriminator minibatch std feature: {std_feat}")
+        #     h = torch.cat([h, std_feat], dim=-1)
+            #print(f"[DEBUG] Discriminator trunk output after adding std feature: {h}")
         return self.linear(h)
 
     def classify(self, latent: torch.Tensor) -> torch.Tensor:
         """Return probabilities of the latent belonging to the teacher distribution."""
-
+        
         logits = self.forward(latent)
+        print(f"[DEBUG] Discriminator logits: {logits}")
         return torch.sigmoid(logits)
 
     def generator_loss(self, student_latent: torch.Tensor) -> torch.Tensor:

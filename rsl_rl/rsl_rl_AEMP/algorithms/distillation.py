@@ -168,10 +168,18 @@ class Distillation:
         mean_disc_loss = 0.0
         mean_student_score = 0.0
         mean_teacher_score = 0.0
+        
+        # Latent statistics
+        mean_student_mean = 0.0
+        mean_student_std = 0.0
+        mean_teacher_mean = 0.0
+        mean_teacher_std = 0.0
+        
         # count how many generator backward passes accumulated since last step
         accum_cnt = 0
         adv_cnt = 0
         disc_cnt = 0
+        gen_cnt = 0
 
         for epoch in range(self.num_learning_epochs):
             self.policy.reset(hidden_states=self.last_hidden_states)
@@ -183,15 +191,42 @@ class Distillation:
                 # compute student and teacher latents
                 
                 student_latent = self.policy.get_student_latent(obs)
+                
+                # --- Statistics & Debug Data Collection ---
+                teacher_latent = None
+                with torch.no_grad():
+                    gen_cnt += 1
+                    mean_student_mean += student_latent.mean().item()
+                    mean_student_std += student_latent.std().item()
+                    
+                    student_score = None
+                    teacher_score = None
+
+                    if self.discriminator is not None:
+                        teacher_latent = self.policy.evaluate_feature(privileged_obs)
+                        mean_teacher_mean += teacher_latent.mean().item()
+                        mean_teacher_std += teacher_latent.std().item()
+                        
+                        student_score = self.discriminator.classify(student_latent)
+                        teacher_score = self.discriminator.classify(teacher_latent)
+
+                        mean_student_score += student_score.mean().item()
+                        mean_teacher_score += teacher_score.mean().item()
+
+                    # Cache last batch data for saving to disk later
+                    self.last_debug_data = {
+                        "obs": obs.detach().cpu(),
+                        "privileged_obs": privileged_obs.detach().cpu(),
+                        "student_latent": student_latent.detach().cpu(),
+                        "teacher_latent": teacher_latent.detach().cpu() if teacher_latent is not None else None,
+                        "student_score": student_score.detach().cpu() if student_score is not None else None,
+                        "teacher_score": teacher_score.detach().cpu() if teacher_score is not None else None,
+                    }
+                # ------------------------------------------
+
                 total_loss = 0.0
 
                 if self.discriminator is not None:
-                    with torch.no_grad():
-                        teacher_latent = self.policy.evaluate_feature(privileged_obs)
-                        # Log scores
-                        mean_student_score += self.discriminator.classify(student_latent).mean().item()
-                        mean_teacher_score += self.discriminator.classify(teacher_latent).mean().item()
-
                     disc_loss_value = 0.0
                     for _ in range(self.discriminator_updates):
                         self.discriminator_optimizer.zero_grad()
@@ -264,8 +299,32 @@ class Distillation:
         self.last_hidden_states = self.policy.get_hidden_states()
         self.policy.detach_hidden_states()
 
+        # --- Log Histograms to WandB (Rank 0 only) ---
+        if self.gpu_global_rank == 0 and self.num_updates % 100 == 0:
+            try:
+                import wandb
+                if wandb.run is not None and hasattr(self, "last_debug_data") and self.last_debug_data is not None:
+                    hists = {
+                        "latent_dist/student": wandb.Histogram(self.last_debug_data["student_latent"].numpy()),
+                    }
+                    if self.last_debug_data["teacher_latent"] is not None:
+                        hists["latent_dist/teacher"] = wandb.Histogram(self.last_debug_data["teacher_latent"].numpy())
+                    wandb.log(hists, commit=False)
+            except ImportError:
+                pass
+        # ---------------------------------------------
+
         # construct the loss dictionary
         loss_dict = {}
+        
+        # Add latent statistics
+        if gen_cnt > 0:
+            loss_dict["latent/student_mean"] = mean_student_mean / gen_cnt
+            loss_dict["latent/student_std"] = mean_student_std / gen_cnt
+            if self.discriminator is not None:
+                loss_dict["latent/teacher_mean"] = mean_teacher_mean / gen_cnt
+                loss_dict["latent/teacher_std"] = mean_teacher_std / gen_cnt
+
         if self.discriminator is not None:
             if adv_cnt > 0:
                 loss_dict["adv"] = mean_adv_loss

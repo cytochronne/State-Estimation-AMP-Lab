@@ -30,6 +30,8 @@ parser.add_argument(
     help="Use the pre-trained checkpoint from Nucleus.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument("--debug_file", type=str, required=True, help="Path to the debug data .pt file.")
+
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -179,11 +181,79 @@ def main():
             max_len = float(max_len)
     except Exception:
         std_lin, lin_thresh, max_len = 0.5, 0.1, None
+    
+    # =================================================================================
+    # LOAD DEBUG DATA
+    # =================================================================================
+    print(f"[INFO] Loading debug data from: {args_cli.debug_file}")
+    try:
+        debug_data = torch.load(args_cli.debug_file, map_location=agent_cfg.device)
+        saved_obs = debug_data["obs"].to(agent_cfg.device)
+        saved_priv_obs = debug_data["privileged_obs"].to(agent_cfg.device)
+        
+        # Load latents and scores for comparison
+        saved_student_latent = debug_data.get("student_latent")
+        if saved_student_latent is not None: saved_student_latent = saved_student_latent.to(agent_cfg.device)
+        
+        saved_teacher_latent = debug_data.get("teacher_latent")
+        if saved_teacher_latent is not None: saved_teacher_latent = saved_teacher_latent.to(agent_cfg.device)
+        
+        saved_student_score = debug_data.get("student_score")
+        if saved_student_score is not None: saved_student_score = saved_student_score.to(agent_cfg.device)
+        
+        saved_teacher_score = debug_data.get("teacher_score")
+        if saved_teacher_score is not None: saved_teacher_score = saved_teacher_score.to(agent_cfg.device)
+
+        print(f"[INFO] Loaded debug data. Obs shape: {saved_obs.shape}, PrivObs shape: {saved_priv_obs.shape}")
+    except Exception as e:
+        print(f"[ERROR] Failed to load debug data: {e}")
+        return
+    # =================================================================================
+
+    # Ensure policy is in eval mode
+    runner.eval_mode()
+
     # simulate environment
     while simulation_app.is_running():
         start_time = time.time()
         # run everything in inference mode
         with torch.inference_mode():
+            
+            # =================================================================================
+            # OVERRIDE OBSERVATIONS WITH DEBUG DATA
+            # =================================================================================
+            # Ensure we match the environment's num_envs
+            current_num_envs = env.num_envs
+            
+            # Slice or repeat saved data to match current_num_envs
+            if saved_obs.shape[0] >= current_num_envs:
+                obs_override = saved_obs[:current_num_envs]
+                priv_obs_override = saved_priv_obs[:current_num_envs]
+                
+                # Prepare comparison data
+                curr_saved_student_latent = saved_student_latent[:current_num_envs] if saved_student_latent is not None else None
+                curr_saved_teacher_latent = saved_teacher_latent[:current_num_envs] if saved_teacher_latent is not None else None
+                curr_saved_student_score = saved_student_score[:current_num_envs] if saved_student_score is not None else None
+                curr_saved_teacher_score = saved_teacher_score[:current_num_envs] if saved_teacher_score is not None else None
+            else:
+                # Repeat if not enough
+                repeat_factor = (current_num_envs // saved_obs.shape[0]) + 1
+                obs_override = saved_obs.repeat(repeat_factor, 1)[:current_num_envs]
+                priv_obs_override = saved_priv_obs.repeat(repeat_factor, 1)[:current_num_envs]
+                
+                # Prepare comparison data
+                curr_saved_student_latent = saved_student_latent.repeat(repeat_factor, 1)[:current_num_envs] if saved_student_latent is not None else None
+                curr_saved_teacher_latent = saved_teacher_latent.repeat(repeat_factor, 1)[:current_num_envs] if saved_teacher_latent is not None else None
+                curr_saved_student_score = saved_student_score.repeat(repeat_factor, 1)[:current_num_envs] if saved_student_score is not None else None
+                curr_saved_teacher_score = saved_teacher_score.repeat(repeat_factor, 1)[:current_num_envs] if saved_teacher_score is not None else None
+            
+            # Apply override
+            obs = obs_override
+            if "observations" not in extras:
+                extras["observations"] = {}
+            extras["observations"]["teacher"] = priv_obs_override
+            # =================================================================================
+
             # Teacher acts
             if "observations" in extras and "teacher" in extras["observations"]:
                 teacher_obs = extras["observations"]["teacher"]
@@ -195,22 +265,52 @@ def main():
             # env stepping
             ret = env.step(actions)
             if isinstance(ret, tuple) and len(ret) == 4:
-                obs, _, term, extras = ret
+                # NOTE: We ignore the returned obs here because we will override it in the next loop iteration
+                # But for the current loop's printing logic below, we should use the OVERRIDDEN obs, not the new one from env.step()
+                # However, play_distill updates `obs` here for the NEXT loop.
+                # Since we override at the start of the loop, it doesn't matter what we get here.
+                # BUT, for the printing logic below (discriminator score), we want to use the obs we just used for action.
+                # So we should NOT update `obs` variable with the result of env.step() if we want to print scores for the current frame.
+                # Actually, play_distill prints scores for the NEW obs (after step).
+                # If we want to debug the saved data, we should print scores for the SAVED data.
+                # So let's capture the new obs in a temp variable, but keep `obs` as the overridden one for printing.
+                _new_obs, _, term, _new_extras = ret
             else:
-                obs, _, term, extras = ret
-
+                _new_obs, _, term, _new_extras = ret
+            
+            # Update extras for metrics (like velocity tracking) from the real env step
+            # But keep observations overridden for the printing logic
+            # Actually, if we want to print scores for the saved data, we should use `obs` (which is overridden).
+            
             # print("INFO:obs", obs)
             # teacher_obs_curr = extras["observations"]["teacher"]
             # print("INFO: priv_obs", teacher_obs_curr)
 
             # Student encodes and discriminator scores (print AFTER step so state is current)
             if discriminator is not None:
+                print("\n" + "="*30 + " DEBUG DATA COMPARISON " + "="*30)
                 try:
+                    # Use the overridden obs
                     student_latent = policy.get_student_latent(obs)
-                    #print("=====================student_latent=====================")
                     score = discriminator.classify(student_latent)
                     disc = score.mean().item()
-                except Exception:
+                    
+                    # Compare Student Latent
+                    if curr_saved_student_latent is not None:
+                        diff = (student_latent - curr_saved_student_latent).abs().mean().item()
+                        print(f"[Student Latent] Saved Mean: {curr_saved_student_latent.mean():.4f}, Std: {curr_saved_student_latent.std():.4f}")
+                        print(f"[Student Latent] Curr  Mean: {student_latent.mean():.4f}, Std: {student_latent.std():.4f}")
+                        print(f"[Student Latent] Diff (L1): {diff:.6f} {'✅' if diff < 1e-5 else '❌'}")
+                    
+                    # Compare Student Score
+                    if curr_saved_student_score is not None:
+                        diff_score = (score - curr_saved_student_score).abs().mean().item()
+                        print(f"[Student Score ] Saved Mean: {curr_saved_student_score.mean():.4f}")
+                        print(f"[Student Score ] Curr  Mean: {score.mean():.4f}")
+                        print(f"[Student Score ] Diff (L1): {diff_score:.6f} {'✅' if diff_score < 1e-5 else '❌'}")
+
+                except Exception as e:
+                    print(f"[ERROR] Student comparison failed: {e}")
                     disc = float('nan')
 
                 # Teacher encodes and discriminator scores
@@ -218,20 +318,39 @@ def main():
                     if "observations" in extras and "teacher" in extras["observations"]:
                         teacher_obs_curr = extras["observations"]["teacher"]
                         if hasattr(policy, "evaluate_feature"):
-                            #print("=====================teacher_latent=====================")
                             teacher_latent = policy.evaluate_feature(teacher_obs_curr)
                             teacher_score = discriminator.classify(teacher_latent)
                             disc_teacher = teacher_score.mean().item()
+                            
+                            # Compare Teacher Latent
+                            if curr_saved_teacher_latent is not None:
+                                diff = (teacher_latent - curr_saved_teacher_latent).abs().mean().item()
+                                print(f"[Teacher Latent] Saved Mean: {curr_saved_teacher_latent.mean():.4f}, Std: {curr_saved_teacher_latent.std():.4f}")
+                                print(f"[Teacher Latent] Curr  Mean: {teacher_latent.mean():.4f}, Std: {teacher_latent.std():.4f}")
+                                print(f"[Teacher Latent] Diff (L1): {diff:.6f} {'✅' if diff < 1e-5 else '❌'}")
+
+                            # Compare Teacher Score
+                            if curr_saved_teacher_score is not None:
+                                diff_score = (teacher_score - curr_saved_teacher_score).abs().mean().item()
+                                print(f"[Teacher Score ] Saved Mean: {curr_saved_teacher_score.mean():.4f}")
+                                print(f"[Teacher Score ] Curr  Mean: {teacher_score.mean():.4f}")
+                                print(f"[Teacher Score ] Diff (L1): {diff_score:.6f} {'✅' if diff_score < 1e-5 else '❌'}")
+
                         else:
                             disc_teacher = float('nan')
                     else:
                         disc_teacher = float('nan')
-                except Exception:
+                except Exception as e:
+                    print(f"[ERROR] Teacher comparison failed: {e}")
                     disc_teacher = float('nan')
+                
+                print("="*83)
 
                 # Compute velocity tracking metrics from env state
-                acc_lin = extras.get("VelTracking/accuracy_lin_xy", None)
-                succ = extras.get("VelTracking/success_rate", None)
+                # We use _new_extras here because these contain the info from the physics step we just performed
+                acc_lin = _new_extras.get("VelTracking/accuracy_lin_xy", None) if isinstance(_new_extras, dict) else None
+                succ = _new_extras.get("VelTracking/success_rate", None) if isinstance(_new_extras, dict) else None
+                
                 try:
                     asset = env.unwrapped.scene["robot"]
                     cmd_b = env.unwrapped.command_manager.get_command("base_velocity")
@@ -261,6 +380,9 @@ def main():
                 if succ is not None:
                     parts.append(f"Success: {float(succ):.3f}")
                 print(" | ".join(parts), end="\r")
+            
+            # Update extras for next loop (though we will override observations again)
+            extras = _new_extras if isinstance(_new_extras, dict) else {}
 
         if args_cli.video:
             timestep += 1

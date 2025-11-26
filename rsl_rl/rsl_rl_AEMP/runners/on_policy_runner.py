@@ -477,8 +477,24 @@ class OnPolicyRunner:
         }
         if getattr(self.alg, "discriminator", None) is not None:
             saved_dict["discriminator_state_dict"] = self.alg.discriminator.state_dict()
+            
+            # --- Discriminator Weight Signature ---
+            disc_params = [p for p in self.alg.discriminator.parameters()]
+            if disc_params:
+                signature = sum(p.norm().item() for p in disc_params)
+                print(f"[Checkpoint Save] Discriminator Weight Signature (L2 Sum): {signature:.6f}")
+            # --------------------------------------
+
             if getattr(self.alg, "discriminator_optimizer", None) is not None:
                 saved_dict["discriminator_optimizer_state_dict"] = self.alg.discriminator_optimizer.state_dict()
+
+        # --- Save Debug Data (Latents, Obs, Scores) ---
+        if hasattr(self.alg, "last_debug_data") and self.alg.last_debug_data is not None:
+            debug_file_path = path.replace(".pt", "_debug_data.pt")
+            torch.save(self.alg.last_debug_data, debug_file_path)
+            print(f"[Checkpoint Save] Saved debug data to: {debug_file_path}")
+        # ----------------------------------------------
+
         # -- Save RND model if used
         if self.alg.rnd:
             saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
