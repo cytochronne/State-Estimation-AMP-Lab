@@ -6,11 +6,12 @@
 # torch
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 
 # rsl-rl
-from rsl_rl_AEMP.modules import Discriminator, StudentTeacher, StudentTeacherRecurrent
-from rsl_rl_AEMP.storage import RolloutStorage
+from rsl_rl_MLE.modules import Discriminator, StudentTeacher, StudentTeacherRecurrent
+from rsl_rl_MLE.storage import RolloutStorage
 
 
 class Distillation:
@@ -49,11 +50,6 @@ class Distillation:
         # distillation components
         self.policy = policy
         self.policy.to(self.device)
-        self.discriminator = None
-        self.discriminator_optimizer = None
-        self.discriminator_updates = 1
-        self.discriminator_grad_pen_lambda = 0.0
-        self.adv_loss_weight = adv_loss_weight
         self.storage = None  # initialized later
         # only train the student encoder (including recurrent memory)
         self.encoder_parameters: list[nn.Parameter] = []
@@ -96,38 +92,6 @@ class Distillation:
 
         self.num_updates = 0
 
-        if discriminator_cfg is not None:
-            self._build_discriminator(discriminator_cfg, learning_rate)
-
-    def _build_discriminator(self, cfg: dict, default_lr: float) -> None:
-        cfg = dict(cfg)
-
-        hidden_dims = cfg.get("hidden_layer_sizes", [256, 256])
-        input_dim = cfg.get("input_dim", getattr(self.policy, "teacher_latent_dim", None))
-        if input_dim is None:
-            raise ValueError(
-                "Could not infer discriminator input dimension. Please provide 'input_dim' in discriminator_cfg "
-                "or ensure the policy exposes 'teacher_latent_dim'."
-            )
-
-        loss_type = cfg.get("loss_type", "BCEWithLogits")
-        use_minibatch_std = cfg.get("use_minibatch_std", True)
-        eta_wgan = cfg.get("eta_wgan", 0.3)
-
-        self.discriminator = Discriminator(
-            input_dim=input_dim,
-            hidden_layer_sizes=hidden_dims,
-            device=self.device,
-            loss_type=loss_type,
-            eta_wgan=eta_wgan,
-            use_minibatch_std=use_minibatch_std,
-        )
-        disc_lr = cfg.get("learning_rate", default_lr)
-        self.discriminator_optimizer = optim.Adam(self.discriminator.parameters(), lr=disc_lr)
-        self.discriminator_updates = int(cfg.get("updates_per_step", 1))
-        self.discriminator_grad_pen_lambda = float(cfg.get("grad_penalty_lambda", 0.0))
-        self.discriminator.train()
-
     def init_storage(
         self, training_type, num_envs, num_transitions_per_env, student_obs_shape, teacher_obs_shape, actions_shape
     ):
@@ -164,117 +128,70 @@ class Distillation:
 
     def update(self):
         self.num_updates += 1
-        mean_adv_loss = 0.0
-        mean_disc_loss = 0.0
-        mean_student_score = 0.0
-        mean_teacher_score = 0.0
+        mean_mle_loss = 0.0
         
         # Latent statistics
-        mean_student_mean = 0.0
-        mean_student_std = 0.0
-        mean_teacher_mean = 0.0
-        mean_teacher_std = 0.0
+        mean_student_mean_norm = 0.0
+        mean_student_sigma_mean = 0.0
+        mean_teacher_mean_norm = 0.0
         
-        # count how many generator backward passes accumulated since last step
         accum_cnt = 0
-        adv_cnt = 0
-        disc_cnt = 0
         gen_cnt = 0
 
         for epoch in range(self.num_learning_epochs):
             self.policy.reset(hidden_states=self.last_hidden_states)
             self.policy.detach_hidden_states()
-            if self.discriminator is not None:
-                self.discriminator.train()
+            
             for obs, privileged_obs, _, privileged_actions, dones in self.storage.generator():
 
                 # compute student and teacher latents
+                student_mean, student_var = self.policy.get_student_latent(obs)
                 
-                student_latent = self.policy.get_student_latent(obs)
-                
+                with torch.no_grad():
+                    teacher_latent = self.policy.evaluate_feature(privileged_obs)
+
                 # --- Statistics & Debug Data Collection ---
-                teacher_latent = None
                 with torch.no_grad():
                     gen_cnt += 1
-                    mean_student_mean += student_latent.mean().item()
-                    mean_student_std += student_latent.std().item()
-                    
-                    student_score = None
-                    teacher_score = None
-
-                    if self.discriminator is not None:
-                        teacher_latent = self.policy.evaluate_feature(privileged_obs)
-                        mean_teacher_mean += teacher_latent.mean().item()
-                        mean_teacher_std += teacher_latent.std().item()
-                        
-                        student_score = self.discriminator.classify(student_latent)
-                        teacher_score = self.discriminator.classify(teacher_latent)
-
-                        mean_student_score += student_score.mean().item()
-                        mean_teacher_score += teacher_score.mean().item()
+                    mean_student_mean_norm += student_mean.norm(dim=-1).mean().item()
+                    mean_student_sigma_mean += student_var.sqrt().mean().item()
+                    mean_teacher_mean_norm += teacher_latent.norm(dim=-1).mean().item()
 
                     # Cache last batch data for saving to disk later
                     self.last_debug_data = {
                         "obs": obs.detach().cpu(),
                         "privileged_obs": privileged_obs.detach().cpu(),
-                        "student_latent": student_latent.detach().cpu(),
-                        "teacher_latent": teacher_latent.detach().cpu() if teacher_latent is not None else None,
-                        "student_score": student_score.detach().cpu() if student_score is not None else None,
-                        "teacher_score": teacher_score.detach().cpu() if teacher_score is not None else None,
+                        "student_mean": student_mean.detach().cpu(),
+                        "student_sigma": student_var.sqrt().detach().cpu(),
+                        "teacher_latent": teacher_latent.detach().cpu(),
                     }
                 # ------------------------------------------
 
-                total_loss = 0.0
+                # MLE Loss
+                mle_loss = F.gaussian_nll_loss(student_mean, teacher_latent, student_var)
+                total_loss = mle_loss
+                mean_mle_loss += mle_loss.item()
 
-                if self.discriminator is not None:
-                    disc_loss_value = 0.0
-                    for _ in range(self.discriminator_updates):
-                        self.discriminator_optimizer.zero_grad()
-                        disc_loss = self.discriminator.discriminator_loss(
-                            student_latent.detach(), teacher_latent
-                        )
-                        grad_pen = self.discriminator.compute_grad_pen(
-                            teacher_latent, student_latent.detach(), self.discriminator_grad_pen_lambda
-                        )
-                        disc_total = disc_loss + grad_pen
-                        disc_total.backward()
-                        if self.is_multi_gpu:
-                            self._reduce_module_gradients(self.discriminator)
-                        self.discriminator_optimizer.step()
-                        disc_loss_value += disc_total.item()
-
-                    disc_loss_value /= max(self.discriminator_updates, 1)
-                    mean_disc_loss += disc_loss_value
-                    disc_cnt += 1
-
-                    if self.adv_loss_weight != 0.0:
-                        adv_loss = self.discriminator.generator_loss(student_latent)
-                        total_loss = total_loss + self.adv_loss_weight * adv_loss
-                        mean_adv_loss += adv_loss.item()
-                        adv_cnt += 1
-
-                # perform immediate backward for generator loss to avoid stale
-                # references to discriminator parameters across its updates
-                if torch.is_tensor(total_loss):
-                    if accum_cnt == 0:
-                        self.optimizer.zero_grad()
-                    next_accum_cnt = accum_cnt + 1
-                    retain_graph = (
-                        self.gradient_length is not None
-                        and self.gradient_length > 1
-                        and (next_accum_cnt % self.gradient_length) != 0
-                    )
-                    total_loss.backward(retain_graph=retain_graph)
-                    accum_cnt = next_accum_cnt
-                    # perform optimizer step based on gradient length
-                    if accum_cnt % self.gradient_length == 0:
-                        if self.is_multi_gpu:
-                            self.reduce_parameters(self.encoder_parameters)
-                        if self.max_grad_norm:
-                            nn.utils.clip_grad_norm_(self.encoder_parameters, self.max_grad_norm)
-                        self.optimizer.step()
-                        self.policy.detach_hidden_states()
-                        accum_cnt = 0
+                # perform immediate backward
+                if accum_cnt == 0:
+                    self.optimizer.zero_grad()
+                next_accum_cnt = accum_cnt + 1
+                retain_graph = (
+                    self.gradient_length is not None
+                    and self.gradient_length > 1
+                    and (next_accum_cnt % self.gradient_length) != 0
+                )
+                total_loss.backward(retain_graph=retain_graph)
+                accum_cnt = next_accum_cnt
+                
+                if accum_cnt % self.gradient_length == 0:
+                    if self.is_multi_gpu:
+                        self.reduce_parameters(self.encoder_parameters)
+                    if self.max_grad_norm:
+                        nn.utils.clip_grad_norm_(self.encoder_parameters, self.max_grad_norm)
+                    self.optimizer.step()
+                    self.policy.detach_hidden_states()
+                    accum_cnt = 0
 
                 # reset dones
                 self.policy.reset(dones.view(-1))
@@ -289,12 +206,9 @@ class Distillation:
             self.optimizer.step()
             self.policy.detach_hidden_states()
 
-        if self.discriminator is not None and adv_cnt > 0:
-            mean_adv_loss /= adv_cnt
-        if self.discriminator is not None and disc_cnt > 0:
-            mean_disc_loss /= disc_cnt
-            mean_student_score /= disc_cnt
-            mean_teacher_score /= disc_cnt
+        if gen_cnt > 0:
+            mean_mle_loss /= gen_cnt
+
         self.storage.clear()
         self.last_hidden_states = self.policy.get_hidden_states()
         self.policy.detach_hidden_states()
@@ -305,10 +219,10 @@ class Distillation:
                 import wandb
                 if wandb.run is not None and hasattr(self, "last_debug_data") and self.last_debug_data is not None:
                     hists = {
-                        "latent_dist/student": wandb.Histogram(self.last_debug_data["student_latent"].numpy()),
+                        "latent_dist/student_mean": wandb.Histogram(self.last_debug_data["student_mean"].numpy()),
+                        "latent_dist/student_sigma": wandb.Histogram(self.last_debug_data["student_sigma"].numpy()),
+                        "latent_dist/teacher": wandb.Histogram(self.last_debug_data["teacher_latent"].numpy()),
                     }
-                    if self.last_debug_data["teacher_latent"] is not None:
-                        hists["latent_dist/teacher"] = wandb.Histogram(self.last_debug_data["teacher_latent"].numpy())
                     wandb.log(hists, commit=False)
             except ImportError:
                 pass
@@ -317,21 +231,11 @@ class Distillation:
         # construct the loss dictionary
         loss_dict = {}
         
-        # Add latent statistics
         if gen_cnt > 0:
-            loss_dict["latent/student_mean"] = mean_student_mean / gen_cnt
-            loss_dict["latent/student_std"] = mean_student_std / gen_cnt
-            if self.discriminator is not None:
-                loss_dict["latent/teacher_mean"] = mean_teacher_mean / gen_cnt
-                loss_dict["latent/teacher_std"] = mean_teacher_std / gen_cnt
-
-        if self.discriminator is not None:
-            if adv_cnt > 0:
-                loss_dict["adv"] = mean_adv_loss
-            if disc_cnt > 0:
-                loss_dict["disc"] = mean_disc_loss
-                loss_dict["student_score"] = mean_student_score
-                loss_dict["teacher_score"] = mean_teacher_score
+            loss_dict["mle_loss"] = mean_mle_loss
+            loss_dict["latent/student_mean_norm"] = mean_student_mean_norm / gen_cnt
+            loss_dict["latent/student_uncertainty"] = mean_student_sigma_mean / gen_cnt
+            loss_dict["latent/teacher_mean_norm"] = mean_teacher_mean_norm / gen_cnt
 
         return loss_dict
 
@@ -343,14 +247,10 @@ class Distillation:
         """Broadcast model parameters to all GPUs."""
         # obtain the model parameters on current GPU
         model_params = [self.policy.state_dict()]
-        if self.discriminator is not None:
-            model_params.append(self.discriminator.state_dict())
         # broadcast the model parameters
         torch.distributed.broadcast_object_list(model_params, src=0)
         # load the model parameters on all GPUs from source GPU
         self.policy.load_state_dict(model_params[0])
-        if self.discriminator is not None and len(model_params) > 1:
-            self.discriminator.load_state_dict(model_params[1])
 
     def reduce_parameters(self, params=None):
         """Collect gradients from all GPUs and average them.

@@ -13,8 +13,8 @@ import torch.nn.functional as F
 from torch.distributions import Normal
 
 from .terrain_aware_actor_critic import TerrainAwareActorCritic
-from rsl_rl_AEMP.networks import Memory
-from rsl_rl_AEMP.utils import resolve_nn_activation
+from rsl_rl_MLE.networks import Memory
+from rsl_rl_MLE.utils import resolve_nn_activation
 
 
 class TerrainAwareStudentTeacher(nn.Module):

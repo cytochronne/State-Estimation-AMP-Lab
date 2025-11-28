@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal
 
-from rsl_rl_AEMP.utils import resolve_nn_activation
+from rsl_rl_MLE.utils import resolve_nn_activation
 
 
 class ActorCritic(nn.Module):
