@@ -18,9 +18,11 @@ unitree_model/
 *.usd
 *.usda
 *.usdc
+*.sh
 
 # System
 .DS_Store
 /IsaacLab
+
 
 DevelopNot.md
