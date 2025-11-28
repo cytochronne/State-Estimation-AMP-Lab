@@ -93,8 +93,8 @@ class TerrainAwareDistillationAlgorithmCfg(RslRlDistillationAlgorithmCfg):
     discriminator_cfg = {
         "hidden_layer_sizes": [256, 256],
         "learning_rate": 5.0e-4,
-        "use_minibatch_std": True,
-        "grad_penalty_lambda": 10.0,
+        "use_minibatch_std": False,
+        "grad_penalty_lambda": 0.05,
     }
     adv_loss_weight = 1.0
 
