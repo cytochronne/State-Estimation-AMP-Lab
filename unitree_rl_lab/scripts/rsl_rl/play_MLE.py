@@ -63,14 +63,9 @@ from isaaclab_tasks.utils import get_checkpoint_path
 import unitree_rl_lab.tasks  # noqa: F401
 from unitree_rl_lab.utils.parser_cfg import parse_env_cfg
 
-# Import debug drawing interface
-from omni.isaac.debug_draw import _debug_draw
 
 def main():
     """Play with RSL-RL agent."""
-    # acquire debug draw interface
-    draw_interface = _debug_draw.acquire_debug_draw_interface()
-    
     # parse configuration
     env_cfg = parse_env_cfg(
         args_cli.task,
@@ -282,18 +277,7 @@ def main():
                 parts.append(f"AccLin: {float(acc_lin):.3f}")
             if succ is not None:
                 parts.append(f"Success: {float(succ):.3f}")
-            
-            info_text = " | ".join(parts)
-            print(info_text, end="\r")
-            
-            # Draw text on viewport
-            draw_interface.clear_lines()
-            draw_interface.draw_text_2d(
-                info_text, 
-                18, 
-                (1.0, 1.0, 0.0, 1.0), # Yellow color
-                (10, 10) # Top-left position
-            )
+            print(" | ".join(parts), end="\r")
 
         if args_cli.video:
             timestep += 1
