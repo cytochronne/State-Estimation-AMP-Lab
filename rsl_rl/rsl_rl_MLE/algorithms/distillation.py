@@ -10,14 +10,14 @@ import torch.nn.functional as F
 import torch.optim as optim
 
 # rsl-rl
-from rsl_rl_MLE.modules import Discriminator, StudentTeacher, StudentTeacherRecurrent
+from rsl_rl_MLE.modules import Discriminator, StudentTeacher, StudentTeacherRecurrent, TerrainAwareStudentTeacher
 from rsl_rl_MLE.storage import RolloutStorage
 
 
 class Distillation:
     """Distillation algorithm for training a student model to mimic a teacher model."""
 
-    policy: StudentTeacher | StudentTeacherRecurrent
+    policy: StudentTeacher | StudentTeacherRecurrent | TerrainAwareStudentTeacher
     """The student teacher model."""
 
     def __init__(

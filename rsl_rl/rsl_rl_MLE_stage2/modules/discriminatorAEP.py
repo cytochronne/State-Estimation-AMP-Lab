@@ -82,7 +82,7 @@ class Discriminator(nn.Module):
 
     def generator_loss(self, student_latent: torch.Tensor) -> torch.Tensor:
         """Loss for the student encoder (generator) to fool the discriminator."""
-
+    
         logits = self.forward(student_latent)
         if self.loss_type == "BCEWithLogits":
             targets = torch.ones_like(logits, device=logits.device)

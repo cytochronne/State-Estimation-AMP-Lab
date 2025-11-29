@@ -10,14 +10,14 @@ import torch.nn.functional as F
 import torch.optim as optim
 
 # rsl-rl
-from rsl_rl_MLE_stage2.modules import Discriminator, StudentTeacher, StudentTeacherRecurrent
+from rsl_rl_MLE_stage2.modules import Discriminator, StudentTeacher, StudentTeacherRecurrent, TerrainAwareStudentTeacher
 from rsl_rl_MLE_stage2.storage import RolloutStorage
 
 
 class Distillation:
     """Distillation algorithm for training a student model to mimic a teacher model."""
 
-    policy: StudentTeacher | StudentTeacherRecurrent
+    policy: StudentTeacher | StudentTeacherRecurrent | TerrainAwareStudentTeacher
     """The student teacher model."""
 
     def __init__(
@@ -125,6 +125,18 @@ class Distillation:
         self.storage.add_transitions(self.transition)
         self.transition.clear()
         self.policy.reset(dones)
+
+    def compute_returns(self, last_critic_obs: torch.Tensor) -> None:
+        """
+        Computes the discounted returns and advantages based on the critic's evaluation of the last observation.
+
+        Parameters
+        ----------
+        last_critic_obs : torch.Tensor
+            The critic observation after the last environment step.
+        """
+        last_values = self.policy.teacher.evaluate(last_critic_obs).detach()
+        self.storage.compute_returns(last_values, self.gamma, self.lam)
 
     def update(self):
         self.num_updates += 1
@@ -295,3 +307,5 @@ class Distillation:
                 numel = param.numel()
                 param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
                 offset += numel
+
+    
