@@ -37,6 +37,9 @@ class Distillation:
         desired_kl=0.01,
         bc_loss_coef=1.0,
         device="cpu",
+        uncertainty_abs_coef = 1.0,
+        uncertainty_delta_coef = 2.0,
+        uncertainty_delta_threshold = 0.03,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
         **kwargs,
@@ -114,6 +117,13 @@ class Distillation:
         self.desired_kl = desired_kl
         self.bc_loss_coef = bc_loss_coef
 
+        # Uncertainty reward parameters
+        self.uncertainty_abs_coef = uncertainty_abs_coef
+        self.uncertainty_delta_coef = uncertainty_delta_coef
+        self.uncertainty_delta_threshold = uncertainty_delta_threshold
+        self.last_uncertainty = None
+        self.reset_uncertainty_history = None
+
         self.num_updates = 0
 
     def init_storage(
@@ -130,6 +140,7 @@ class Distillation:
             None,
             self.device,
         )
+        self.reset_uncertainty_history = torch.ones(num_envs, dtype=torch.bool, device=self.device)
     
     def act(self, obs, teacher_obs):
         # 1. Student acts (RL)
@@ -138,7 +149,35 @@ class Distillation:
         # or if student had a critic we would use it. Here we assume teacher critic.
         
         # Student action
-        self.transition.actions = self.policy.act(obs).detach()
+        if hasattr(self.policy, "get_student_latent"):
+            mean, cov = self.policy.get_student_latent(obs)
+            uncertainty = cov.sum(dim=-1, keepdim=True) # (N, 1)
+            
+            # Reconstruct policy input
+            policy_input = torch.cat([mean, uncertainty], dim=-1)
+            self.policy.update_distribution(policy_input)
+            self.transition.actions = self.policy.distribution.sample().detach()
+            
+            # --- Uncertainty Reward ---
+            # 1. Absolute penalty
+            unc_reward = -self.uncertainty_abs_coef * (uncertainty + self.last_uncertainty)
+            
+            # 2. Delta reward (improvement)
+            if self.last_uncertainty is not None:
+                delta = self.last_uncertainty - uncertainty
+                # If reset happened, delta should be 0 (or handled appropriately)
+                delta = torch.where(self.reset_uncertainty_history.unsqueeze(-1), torch.zeros_like(delta), delta)
+                # If delta is too small, set to zero
+                if delta <= self.uncertainty_delta_threshold:
+                    delta = torch.zeros_like(delta)
+                unc_reward += self.uncertainty_delta_coef * delta
+            
+            self.current_unc_reward = unc_reward.detach()
+            self.last_uncertainty = uncertainty.detach()
+        else:
+            self.transition.actions = self.policy.act(obs).detach()
+            self.current_unc_reward = torch.zeros(obs.shape[0], 1, device=self.device)
+
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.policy.action_mean.detach()
         self.transition.action_sigma = self.policy.action_std.detach()
@@ -164,6 +203,12 @@ class Distillation:
         return self.transition.actions
 
     def process_env_step(self, rewards, dones, infos):
+        # Add uncertainty reward
+        if hasattr(self, "current_unc_reward"):
+             rewards += self.current_unc_reward.squeeze(-1)
+        
+        self.reset_uncertainty_history = dones.clone()
+
         # record the rewards and dones
         self.transition.rewards = rewards
         self.transition.dones = dones
@@ -255,7 +300,16 @@ class Distillation:
 
                 # 7. BC Loss (MSE)
                 # Student action (mu_batch) vs Teacher action (privileged_actions_batch)
-                bc_loss = F.mse_loss(mu_batch, privileged_actions_batch)
+                bc_loss_raw = F.mse_loss(mu_batch, privileged_actions_batch, reduction="none").mean(dim=-1)
+                
+                # Dynamic BC weight based on uncertainty: 1 / (1 + uncertainty)
+                # uncertainty is already calculated as student_var_detached.sum(dim=-1)
+                # We use the detached uncertainty to avoid gradients flowing back from the weight itself
+                uncertainty_batch = student_var_detached.sum(dim=-1)
+                bc_weight = 1.0 / (1.0 + uncertainty_batch)
+                
+                # Weighted BC loss
+                bc_loss = (bc_loss_raw * bc_weight).mean()
 
                 # 8. Value Loss (Teacher Critic)
                 if self.critic_optimizer is not None:
