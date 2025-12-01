@@ -183,9 +183,9 @@ class TerrainAwareStudentTeacher(nn.Module):
             return obs, empty
         return obs[..., :-height_dim], obs[..., -height_dim:]
 
-    def _prepare_student_features(self, observations: torch.Tensor) -> torch.Tensor:
+    def _prepare_student_features(self, observations: torch.Tensor, masks=None, hidden_states=None) -> torch.Tensor:
         core_obs, _ = self._split_obs(observations, self.student_height_dim)
-        core_features = self.memory_s(core_obs)
+        core_features = self.memory_s(core_obs, masks=masks, hidden_states=hidden_states)
         latent = self.student_encoder(core_features.squeeze(0))
         return latent
 
@@ -200,8 +200,8 @@ class TerrainAwareStudentTeacher(nn.Module):
             raise ValueError("Unknown standard deviation type. Should be 'scalar' or 'log'.")
         self.distribution = Normal(mean, std)
 
-    def act(self, observations: torch.Tensor) -> torch.Tensor:
-        mean, cov = self.get_student_latent(observations)
+    def act(self, observations: torch.Tensor, masks=None, hidden_states=None) -> torch.Tensor:
+        mean, cov = self.get_student_latent(observations, masks, hidden_states)
         uncertainty = cov.sum(dim=-1, keepdim=True)
         policy_input = torch.cat([mean, uncertainty], dim=-1)
         self.update_distribution(policy_input)
@@ -230,8 +230,11 @@ class TerrainAwareStudentTeacher(nn.Module):
                 self.teacher.actor_fusion_encoder,
             )
 
-    def get_student_latent(self, observations: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        features = self._prepare_student_features(observations)
+    def get_actions_log_prob(self, actions):
+        return self.distribution.log_prob(actions).sum(dim=-1)
+
+    def get_student_latent(self, observations: torch.Tensor, masks=None, hidden_states=None) -> tuple[torch.Tensor, torch.Tensor]:
+        features = self._prepare_student_features(observations, masks, hidden_states)
         mean = features[..., :self.teacher_latent_dim]
         sigma = F.softplus(features[..., self.teacher_latent_dim:]) + 1e-4
         cov = sigma.pow(2)
