@@ -65,6 +65,12 @@ class RolloutStorage:
         # for distillation
         if training_type == "distillation":
             self.privileged_actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
+            self.values = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+            self.actions_log_prob = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+            self.mu = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
+            self.sigma = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
+            self.returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+            self.advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
 
         # for reinforcement learning
         if training_type == "rl":
@@ -102,6 +108,10 @@ class RolloutStorage:
         # for distillation
         if self.training_type == "distillation":
             self.privileged_actions[self.step].copy_(transition.privileged_actions)
+            self.values[self.step].copy_(transition.values)
+            self.actions_log_prob[self.step].copy_(transition.actions_log_prob.view(-1, 1))
+            self.mu[self.step].copy_(transition.action_mean)
+            self.sigma[self.step].copy_(transition.action_sigma)
 
         # for reinforcement learning
         if self.training_type == "rl":
@@ -182,7 +192,7 @@ class RolloutStorage:
 
     # for reinforcement learning with feedforward networks
     def mini_batch_generator(self, num_mini_batches, num_epochs=8):
-        if self.training_type != "rl":
+        if self.training_type != "rl" and self.training_type != "distillation":
             raise ValueError("This function is only available for reinforcement learning training.")
         batch_size = self.num_envs * self.num_transitions_per_env
         mini_batch_size = batch_size // num_mini_batches
@@ -244,7 +254,7 @@ class RolloutStorage:
 
     # for reinfrocement learning with recurrent networks
     def recurrent_mini_batch_generator(self, num_mini_batches, num_epochs=8):
-        if self.training_type != "rl":
+        if self.training_type != "rl" and self.training_type != "distillation":
             raise ValueError("This function is only available for reinforcement learning training.")
         padded_obs_trajectories, trajectory_masks = split_and_pad_trajectories(self.observations, self.dones)
         if self.privileged_observations is not None:

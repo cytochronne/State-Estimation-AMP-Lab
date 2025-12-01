@@ -278,7 +278,7 @@ class OnPolicyRunner:
                 start = stop
 
                 # compute returns
-                if self.training_type == "rl":
+                if self.training_type in ["rl", "distillation"]:
                     self.alg.compute_returns(privileged_obs)
 
             # update policy

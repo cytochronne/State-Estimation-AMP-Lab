@@ -150,3 +150,25 @@ class StudentTeacher(nn.Module):
 
     def detach_hidden_states(self, dones=None):
         pass
+
+    @property
+    def student_encoder(self):
+        # Return all layers except the last Linear layer
+        return self.student[:-1]
+
+    @property
+    def student_policy_head(self):
+        # Return the last Linear layer
+        return self.student[-1]
+
+    def get_student_latent(self, obs):
+        # Return latent representation (output of encoder) and dummy variance
+        latent = self.student_encoder(obs)
+        # Assuming unit variance for now as the encoder is deterministic
+        return latent, torch.ones_like(latent)
+
+    def evaluate_feature(self, teacher_obs):
+        # Return teacher's latent representation
+        # Assuming teacher has same structure as student
+        return self.teacher[:-1](teacher_obs)
+

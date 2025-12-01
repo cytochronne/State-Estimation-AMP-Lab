@@ -19,7 +19,7 @@ class Distillation:
 
     policy: StudentTeacher | StudentTeacherRecurrent
     """The student teacher model."""
-
+        
     def __init__(
         self,
         policy,
@@ -31,6 +31,16 @@ class Distillation:
         discriminator_cfg: dict | None = None,
         adv_loss_weight: float = 0.0,
         device="cpu",
+        # PPO parameters
+        clip_param=0.2,
+        num_mini_batches=4,
+        value_loss_coef=1.0,
+        entropy_coef=0.0,
+        gamma=0.99,
+        lam=0.95,
+        desired_kl=0.01,
+        schedule="fixed",
+        policy_head_lr=1e-3,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
     ):
@@ -55,13 +65,15 @@ class Distillation:
         self.encoder_parameters: list[nn.Parameter] = []
         if hasattr(self.policy, "memory_s"):
             self.encoder_parameters.extend(p for p in self.policy.memory_s.parameters())
+        
+        # Try to find encoder parameters
         student_module = getattr(self.policy, "student", None)
-        if student_module is not None and hasattr(student_module, "get"):
+        if hasattr(self.policy, "student_encoder"):
+             self.encoder_parameters.extend(p for p in self.policy.student_encoder.parameters())
+        elif student_module is not None and hasattr(student_module, "get"):
             encoder_module = student_module.get("encoder")
             if encoder_module is not None:
                 self.encoder_parameters.extend(p for p in encoder_module.parameters())
-        elif hasattr(self.policy, "student_encoder"):
-            self.encoder_parameters.extend(p for p in self.policy.student_encoder.parameters())
 
         if not self.encoder_parameters:
             raise ValueError("No encoder parameters found to optimise. Ensure the policy exposes an encoder module.")
@@ -73,6 +85,21 @@ class Distillation:
                 param.requires_grad_(False)
 
         self.optimizer = optim.Adam(self.encoder_parameters, lr=learning_rate)
+        
+        # Setup Policy Head Optimizer for BC and RL
+        self.policy_head_parameters = []
+        if policy_head is not None:
+            # Unfreeze for head training
+            for param in policy_head.parameters():
+                param.requires_grad_(True)
+            self.policy_head_parameters.extend(policy_head.parameters())
+            
+        if not self.policy_head_parameters:
+             print("Warning: No policy head parameters found. BC/RL updates will be skipped for head.")
+             self.optimizer_head = None
+        else:
+             self.optimizer_head = optim.Adam(self.policy_head_parameters, lr=policy_head_lr)
+
         self.transition = RolloutStorage.Transition()
         self.last_hidden_states = None
 
@@ -81,6 +108,16 @@ class Distillation:
         self.gradient_length = gradient_length
         self.learning_rate = learning_rate
         self.max_grad_norm = max_grad_norm
+        
+        # PPO parameters
+        self.clip_param = clip_param
+        self.num_mini_batches = num_mini_batches
+        self.value_loss_coef = value_loss_coef
+        self.entropy_coef = entropy_coef
+        self.gamma = gamma
+        self.lam = lam
+        self.desired_kl = desired_kl
+        self.schedule = schedule
 
         # # initialize the loss function
         # if loss_type == "mse":
@@ -97,7 +134,7 @@ class Distillation:
     ):
         # create rollout storage
         self.storage = RolloutStorage(
-            training_type,
+            "distillation", # Use distillation type but RolloutStorage now allocates RL buffers too
             num_envs,
             num_transitions_per_env,
             student_obs_shape,
@@ -108,14 +145,39 @@ class Distillation:
         )
     
     def act(self, obs, teacher_obs):
-        # use the teacher to interact with the environment
+        # Student interacts with environment
+        self.transition.actions = self.policy.act(obs).detach()
+        
+        # Compute RL data
+        if hasattr(self.policy, "get_actions_log_prob"):
+            self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
+        elif hasattr(self.policy, "distribution") and self.policy.distribution is not None:
+             self.transition.actions_log_prob = self.policy.distribution.log_prob(self.transition.actions).sum(dim=-1).unsqueeze(-1).detach()
+        
+        # Value function (if available, else 0)
+        # Note: evaluate(teacher_obs) returns teacher actions in StudentTeacher!
+        # We need a critic. If none, use 0.
+        # Assuming StudentTeacher doesn't have a critic for now.
+        self.transition.values = torch.zeros(self.transition.actions.shape[0], 1, device=self.device)
+        
+        if hasattr(self.policy, "action_mean"):
+            self.transition.action_mean = self.policy.action_mean.detach()
+        if hasattr(self.policy, "action_std"):
+            self.transition.action_sigma = self.policy.action_std.detach()
+
+        # Teacher actions for BC
         teacher_actions = self.policy.evaluate(teacher_obs).detach()
-        self.transition.actions = teacher_actions
         self.transition.privileged_actions = teacher_actions
+        
         # record the observations
         self.transition.observations = obs
         self.transition.privileged_observations = teacher_obs
         return self.transition.actions
+
+    def compute_returns(self, last_critic_obs):
+        # Use 0 for last value if no critic
+        last_values = torch.zeros(last_critic_obs.shape[0], 1, device=self.device)
+        self.storage.compute_returns(last_values, self.gamma, self.lam)
 
     def process_env_step(self, rewards, dones, infos):
         # record the rewards and dones
@@ -129,6 +191,8 @@ class Distillation:
     def update(self):
         self.num_updates += 1
         mean_mle_loss = 0.0
+        mean_bc_loss = 0.0
+        mean_rl_loss = 0.0
         
         # Latent statistics
         mean_student_mean_norm = 0.0
@@ -139,10 +203,11 @@ class Distillation:
         gen_cnt = 0
 
         for epoch in range(self.num_learning_epochs):
+            # --- Generator Loop (MLE + BC) ---
             self.policy.reset(hidden_states=self.last_hidden_states)
             self.policy.detach_hidden_states()
             
-            for obs, privileged_obs, _, privileged_actions, dones in self.storage.generator():
+            for obs, privileged_obs, _, teacher_actions, dones in self.storage.generator():
 
                 # compute student and teacher latents
                 student_mean, student_var = self.policy.get_student_latent(obs)
@@ -169,27 +234,55 @@ class Distillation:
 
                 # MLE Loss
                 mle_loss = F.gaussian_nll_loss(student_mean, teacher_latent, student_var)
-                total_loss = mle_loss
                 mean_mle_loss += mle_loss.item()
+                
+                # BC Loss
+                # Detach latent to prevent gradients flowing to encoder
+                student_latent_bc = student_mean.detach()
+                if hasattr(self.policy, "student_policy_head"):
+                    student_action_bc = self.policy.student_policy_head(student_latent_bc)
+                    bc_loss = (student_action_bc - teacher_actions).pow(2).mean()
+                    mean_bc_loss += bc_loss.item()
+                else:
+                    bc_loss = torch.tensor(0.0, device=self.device)
 
                 # perform immediate backward
                 if accum_cnt == 0:
                     self.optimizer.zero_grad()
+                    if self.optimizer_head:
+                        self.optimizer_head.zero_grad()
+                
                 next_accum_cnt = accum_cnt + 1
                 retain_graph = (
                     self.gradient_length is not None
                     and self.gradient_length > 1
                     and (next_accum_cnt % self.gradient_length) != 0
                 )
-                total_loss.backward(retain_graph=retain_graph)
+                
+                # MLE Backward (Encoder)
+                mle_loss.backward(retain_graph=retain_graph)
+                
+                # BC Backward (Head)
+                if self.optimizer_head:
+                    bc_loss.backward(retain_graph=retain_graph)
+
                 accum_cnt = next_accum_cnt
                 
                 if accum_cnt % self.gradient_length == 0:
                     if self.is_multi_gpu:
                         self.reduce_parameters(self.encoder_parameters)
+                        if self.optimizer_head:
+                            self.reduce_parameters(self.policy_head_parameters)
+                            
                     if self.max_grad_norm:
                         nn.utils.clip_grad_norm_(self.encoder_parameters, self.max_grad_norm)
+                        if self.optimizer_head:
+                            nn.utils.clip_grad_norm_(self.policy_head_parameters, self.max_grad_norm)
+                            
                     self.optimizer.step()
+                    if self.optimizer_head:
+                        self.optimizer_head.step()
+                        
                     self.policy.detach_hidden_states()
                     accum_cnt = 0
 
@@ -197,17 +290,77 @@ class Distillation:
                 self.policy.reset(dones.view(-1))
                 self.policy.detach_hidden_states(dones.view(-1))
 
-        # flush remaining accumulated gradients
-        if accum_cnt > 0:
-            if self.is_multi_gpu:
-                self.reduce_parameters(self.encoder_parameters)
-            if self.max_grad_norm:
-                nn.utils.clip_grad_norm_(self.encoder_parameters, self.max_grad_norm)
-            self.optimizer.step()
-            self.policy.detach_hidden_states()
+            # flush remaining accumulated gradients
+            if accum_cnt > 0:
+                if self.is_multi_gpu:
+                    self.reduce_parameters(self.encoder_parameters)
+                    if self.optimizer_head:
+                        self.reduce_parameters(self.policy_head_parameters)
+                if self.max_grad_norm:
+                    nn.utils.clip_grad_norm_(self.encoder_parameters, self.max_grad_norm)
+                    if self.optimizer_head:
+                        nn.utils.clip_grad_norm_(self.policy_head_parameters, self.max_grad_norm)
+                self.optimizer.step()
+                if self.optimizer_head:
+                    self.optimizer_head.step()
+                self.policy.detach_hidden_states()
+                accum_cnt = 0
+
+            # --- RL Loop (Mini-batch) ---
+            if self.optimizer_head:
+                # Choose generator based on recurrence
+                if getattr(self.policy, "is_recurrent", False):
+                    generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, num_epochs=1)
+                else:
+                    generator = self.storage.mini_batch_generator(self.num_mini_batches, num_epochs=1)
+
+                # Run 1 epoch of RL updates per outer epoch
+                for batch in generator:
+                    obs_batch, critic_obs_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, hid_states_batch, masks_batch, rnd_state_batch = batch
+                    
+                    # PPO Update
+                    if getattr(self.policy, "is_recurrent", False):
+                        self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
+                    else:
+                        self.policy.act(obs_batch)
+                    
+                    if hasattr(self.policy, "get_actions_log_prob"):
+                        actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
+                    elif hasattr(self.policy, "distribution"):
+                        actions_log_prob_batch = self.policy.distribution.log_prob(actions_batch).sum(dim=-1).unsqueeze(-1)
+                    
+                    # Value function (dummy 0)
+                    value_batch = torch.zeros_like(target_values_batch)
+                    
+                    entropy_batch = self.policy.entropy
+
+                    # Surrogate loss
+                    ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
+                    surrogate = -torch.squeeze(advantages_batch) * ratio
+                    surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
+                        ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
+                    )
+                    surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+
+                    # Value loss (dummy)
+                    value_loss = (returns_batch - value_batch).pow(2).mean()
+
+                    loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+                    
+                    self.optimizer_head.zero_grad()
+                    loss.backward()
+                    if self.max_grad_norm:
+                        nn.utils.clip_grad_norm_(self.policy_head_parameters, self.max_grad_norm)
+                    self.optimizer_head.step()
+                    
+                    mean_rl_loss += loss.item()
 
         if gen_cnt > 0:
             mean_mle_loss /= gen_cnt
+            mean_bc_loss /= gen_cnt
+        
+        # Normalize RL loss by number of batches * epochs
+        mean_rl_loss /= (self.num_learning_epochs * self.num_mini_batches)
 
         self.storage.clear()
         self.last_hidden_states = self.policy.get_hidden_states()
@@ -233,6 +386,8 @@ class Distillation:
         
         if gen_cnt > 0:
             loss_dict["mle_loss"] = mean_mle_loss
+            loss_dict["bc_loss"] = mean_bc_loss
+            loss_dict["rl_loss"] = mean_rl_loss
             loss_dict["latent/student_mean_norm"] = mean_student_mean_norm / gen_cnt
             loss_dict["latent/student_uncertainty"] = mean_student_sigma_mean / gen_cnt
             loss_dict["latent/teacher_mean_norm"] = mean_teacher_mean_norm / gen_cnt
