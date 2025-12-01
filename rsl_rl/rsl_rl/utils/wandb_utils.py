@@ -34,8 +34,9 @@ class WandbSummaryWriter(SummaryWriter):
         except KeyError:
             entity = None
 
-        # Initialize wandb in offline mode
-        wandb.init(project=project, entity=entity, name=run_name, mode="offline")
+        # Initialize wandb run
+        self._run = wandb.init(project=project, entity=entity, name=run_name, mode="online")
+        self._run.define_metric("*", step_metric="iteration")
 
         # Add log directory to wandb
         wandb.config.update({"log_dir": log_dir})
@@ -62,10 +63,12 @@ class WandbSummaryWriter(SummaryWriter):
             walltime=walltime,
             new_style=new_style,
         )
-        # 确保step参数是整数类型
+        # 使用训练轮次 iteration 作为统一的X轴
         step = int(global_step) if global_step is not None else None
-        wandb.log({self._map_path(tag): scalar_value}, step=step)
-
+        payload = {self._map_path(tag): scalar_value}
+        if step is not None:
+            payload["iteration"] = step
+        wandb.log(payload)
     def stop(self):
         wandb.finish()
 

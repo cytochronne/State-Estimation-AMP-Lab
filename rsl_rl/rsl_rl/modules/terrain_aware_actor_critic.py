@@ -46,6 +46,11 @@ class TerrainAwareActorCritic(nn.Module):
         rnn_type: str = "lstm",
         rnn_hidden_dim: int = 256,
         rnn_num_layers: int = 1,
+        uncertainty_method: str = "none",
+        uncertainty_num_models: int = 1,
+        uncertainty_num_passes: int = 1,
+        uncertainty_dropout_prob: float = 0.0,
+        dz_hidden_dims: Sequence[int] = (128, 64),
         **kwargs,
     ) -> None:
         super().__init__()
@@ -87,11 +92,31 @@ class TerrainAwareActorCritic(nn.Module):
         actor_fusion_in_dim = self.actor_core_dim + self.height_embedding_dim
         critic_fusion_in_dim = self.critic_core_dim + self.height_embedding_dim
 
+        self.uncertainty_method = uncertainty_method
+        self.uncertainty_num_models = max(int(uncertainty_num_models), 1)
+        self.uncertainty_num_passes = max(int(uncertainty_num_passes), 1)
+        self.uncertainty_dropout_prob = float(uncertainty_dropout_prob)
+
+        # policy fusion encoder (no dropout to keep training behavior stable)
         self.actor_fusion_encoder, self.actor_fusion_dim = self._build_fusion_encoder(
-            actor_fusion_in_dim, fusion_encoder_dims, activation_name
+            actor_fusion_in_dim, fusion_encoder_dims, activation_name, 0.0, False
         )
+
+        # uncertainty encoders (separate from policy path)
+        if self.uncertainty_method == "ensemble" and self.uncertainty_num_models > 1:
+            self.actor_fusion_ensemble = nn.ModuleList()
+            for _ in range(self.uncertainty_num_models):
+                enc, _ = self._build_fusion_encoder(
+                    actor_fusion_in_dim, fusion_encoder_dims, activation_name, 0.0, False
+                )
+                self.actor_fusion_ensemble.append(enc)
+        elif self.uncertainty_method == "mc_dropout":
+            self.actor_fusion_encoder_uncertainty, _ = self._build_fusion_encoder(
+                actor_fusion_in_dim, fusion_encoder_dims, activation_name, self.uncertainty_dropout_prob, True
+            )
+
         self.critic_fusion_encoder, self.critic_fusion_dim = self._build_fusion_encoder(
-            critic_fusion_in_dim, fusion_encoder_dims, activation_name
+            critic_fusion_in_dim, fusion_encoder_dims, activation_name, 0.0, False
         )
 
         self.actor = self._build_head(self.actor_fusion_dim, actor_hidden_dims, num_actions, activation_name)
@@ -102,6 +127,8 @@ class TerrainAwareActorCritic(nn.Module):
         print(f"Critic fusion encoder: {self.critic_fusion_encoder}")
         print(f"Actor head: {self.actor}")
         print(f"Critic head: {self.critic}")
+
+        self.d_z = self._build_head(self.actor_fusion_dim, dz_hidden_dims, 1, activation_name)
 
         # Action noise configuration
         self.noise_std_type = noise_std_type
@@ -182,13 +209,24 @@ class TerrainAwareActorCritic(nn.Module):
 
     @staticmethod
     def _build_fusion_encoder(
-        input_dim: int, hidden_dims: Sequence[int] | None, activation_name: str
+        input_dim: int,
+        hidden_dims: Sequence[int] | None,
+        activation_name: str,
+        dropout_prob: float = 0.0,
+        mc_dropout: bool = False,
     ) -> tuple[nn.Module, int]:
         if input_dim == 0:
             return nn.Identity(), 0
 
         if not hidden_dims:
             return nn.Identity(), input_dim
+
+        class _MCDropout(nn.Module):
+            def __init__(self, p: float):
+                super().__init__()
+                self.p = float(p)
+            def forward(self, x):
+                return F.dropout(x, self.p, True, False)
 
         dims = list(hidden_dims)
         layers: list[nn.Module] = []
@@ -197,6 +235,8 @@ class TerrainAwareActorCritic(nn.Module):
             layers.append(nn.Linear(prev_dim, dim))
             if idx < len(dims) - 1:
                 layers.append(resolve_nn_activation(activation_name))
+                if mc_dropout and dropout_prob > 0.0:
+                    layers.append(_MCDropout(dropout_prob))
             prev_dim = dim
         return nn.Sequential(*layers), dims[-1]
 
@@ -278,3 +318,30 @@ class TerrainAwareActorCritic(nn.Module):
     def load_state_dict(self, state_dict, strict: bool = True):
         super().load_state_dict(state_dict, strict=strict)
         return True
+
+    def score_dz(self, observations):
+        core, height = self._split_obs(observations, self.actor_height_dim)
+        height_feat = self._encode_height(height, self.actor_height_dim)
+        if height_feat.numel() != 0:
+            fusion_input = torch.cat((core, height_feat), dim=-1)
+        else:
+            fusion_input = core
+        scores = []
+        if self.uncertainty_method == "ensemble" and hasattr(self, "actor_fusion_ensemble"):
+            for enc in self.actor_fusion_ensemble:
+                z = enc(fusion_input)
+                s = self.d_z(z).squeeze(-1)
+                scores.append(s)
+        elif self.uncertainty_method == "mc_dropout" and hasattr(self, "actor_fusion_encoder_uncertainty"):
+            for _ in range(self.uncertainty_num_passes):
+                z = self.actor_fusion_encoder_uncertainty(fusion_input)
+                s = self.d_z(z).squeeze(-1)
+                scores.append(s)
+        else:
+            z = self.actor_fusion_encoder(fusion_input)
+            s = self.d_z(z).squeeze(-1)
+            scores.append(s)
+        stacked = torch.stack(scores, dim=0)
+        var = stacked.var(dim=0, unbiased=False)
+        mean = stacked.mean(dim=0)
+        return mean, var, stacked

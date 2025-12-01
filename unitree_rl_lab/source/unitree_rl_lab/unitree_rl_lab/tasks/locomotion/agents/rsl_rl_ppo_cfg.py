@@ -17,6 +17,11 @@ class TerrainAwarePpoActorCriticCfg(RslRlPpoActorCriticCfg):
     rnn_hidden_dim = 256
     rnn_num_layers = 1
     noise_std_type = "scalar"
+    uncertainty_method = "none"
+    uncertainty_num_models = 1
+    uncertainty_num_passes = 1
+    uncertainty_dropout_prob = 0.0
+    dz_hidden_dims = (128, 64)
 
 
 @configclass
@@ -38,8 +43,8 @@ class TerrainAwareStudentTeacherCfg(RslRlPpoActorCriticCfg):
 @configclass
 class BasePPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 24
-    max_iterations = 50000
-    save_interval = 100
+    max_iterations = 10000
+    save_interval = 500
     experiment_name = ""  # same as task name
     empirical_normalization = False
     # obs_groups = {
@@ -78,6 +83,11 @@ class TerrainAwarePPORunnerCfg(BasePPORunnerCfg):
         critic_hidden_dims=[512, 256, 128],
         activation="elu",
         height_obs_dim=187,
+        uncertainty_method="mc_dropout",
+        uncertainty_num_models=1,
+        uncertainty_num_passes=10,
+        uncertainty_dropout_prob=0.2,
+        dz_hidden_dims=(128, 64),
     )
 
 

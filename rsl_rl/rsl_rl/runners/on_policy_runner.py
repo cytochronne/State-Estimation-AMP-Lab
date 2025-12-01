@@ -35,6 +35,7 @@ class OnPolicyRunner:
         self.policy_cfg = train_cfg["policy"]
         self.device = device
         self.env = env
+        self.last_obs = None
 
         # check if multi-gpu is enabled
         self._configure_multi_gpu()
@@ -75,6 +76,15 @@ class OnPolicyRunner:
         policy: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent = policy_class(
             num_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg
         ).to(self.device)
+        try:
+            print(
+                f"[INFO] Uncertainty: method={getattr(policy, 'uncertainty_method', 'none')}, "
+                f"num_models={getattr(policy, 'uncertainty_num_models', 1)}, "
+                f"num_passes={getattr(policy, 'uncertainty_num_passes', 1)}, "
+                f"dropout_prob={getattr(policy, 'uncertainty_dropout_prob', 0.0)}"
+            )
+        except Exception:
+            pass
 
         # resolve dimension of rnd gated state
         if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
@@ -219,6 +229,7 @@ class OnPolicyRunner:
                         )
                     else:
                         privileged_obs = obs
+                    self.last_obs = obs
 
                     # process the step
                     self.alg.process_env_step(rewards, dones, infos)
@@ -339,6 +350,24 @@ class OnPolicyRunner:
         self.writer.add_scalar("Perf/collection time", locs["collection_time"], locs["it"])
         self.writer.add_scalar("Perf/learning_time", locs["learn_time"], locs["it"])
 
+        dz_vm = None
+        dz_vx = None
+        dz_m = None
+        try:
+            if hasattr(self.alg.policy, "score_dz") and self.last_obs is not None:
+                _obs = self.last_obs.clone()
+                with torch.no_grad():
+                    dz_mean, dz_var, _ = self.alg.policy.score_dz(_obs)
+                dz_vm = dz_var.mean().item()
+                dz_vx = dz_var.max().item()
+                dz_m = dz_mean.mean().item()
+                self.writer.add_scalar("Uncertainty/dz_var_mean", dz_vm, locs["it"]) 
+                self.writer.add_scalar("Uncertainty/dz_var_max", dz_vx, locs["it"]) 
+                self.writer.add_scalar("Uncertainty/dz_mean", dz_m, locs["it"]) 
+                self.writer.add_scalar("Uncertainty/dz_var_std", math.sqrt(dz_vm), locs["it"]) 
+        except Exception as _e:
+            print(f"[WARN] Uncertainty logging failed: {type(_e).__name__}: {_e}")
+
         # -- Training
         if len(locs["rewbuffer"]) > 0:
             # separate logging for intrinsic and extrinsic rewards
@@ -371,34 +400,17 @@ class OnPolicyRunner:
                 self.writer.add_scalar('Train/success_rate', success_rate, locs['it'])
                 self.writer.add_scalar('Train/success_rate/time', success_rate, self.tot_time)
         
-        # 添加线速度追踪准确度监控指标（0-1范围）
-        try:
-            # 获取命令管理器中的基础速度命令
-            command_term = self.env.command_manager.get_term('base_velocity')
-            
-            # 获取实际线速度（从机器人状态获取）
-            actual_lin_vel = self.env.robot.data.base_lin_vel[:, :2]  # 获取x和y方向的线速度
-            
-            # 获取期望线速度（从命令中获取）
-            desired_lin_vel = command_term.command[:, :2]  # 获取x和y方向的期望速度
-            
-            # 计算速度误差的平方和
+        env_core = getattr(self.env, 'unwrapped', None) or self.env
+        if hasattr(env_core, 'command_manager') and hasattr(env_core, 'robot'):
+            command_term = env_core.command_manager.get_term('base_velocity')
+            actual_lin_vel = env_core.robot.data.base_lin_vel[:, :2]
+            desired_lin_vel = command_term.command[:, :2]
             velocity_error = torch.sum(torch.square(actual_lin_vel - desired_lin_vel), dim=1)
-            
-            # 使用与奖励函数相同的参数计算准确度（参考track_lin_vel_xy_exp）
-            std = math.sqrt(0.25)  # 与配置文件中的std保持一致
+            std = math.sqrt(0.25)
             lin_vel_accuracy = torch.exp(-velocity_error / (std ** 2))
-            
-            # 计算平均准确度
             avg_lin_vel_accuracy = torch.mean(lin_vel_accuracy).item()
-            
-            # 记录到wandb
             self.writer.add_scalar('Metrics/lin_vel_tracking_accuracy', avg_lin_vel_accuracy, locs['it'])
             self.writer.add_scalar('Metrics/lin_vel_tracking_accuracy/time', avg_lin_vel_accuracy, self.tot_time)
-            
-        except Exception as e:
-            # 如果计算过程中出现错误，记录但不中断训练
-            print(f"Error calculating linear velocity tracking accuracy: {e}")
                 
         str = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
 
@@ -413,6 +425,10 @@ class OnPolicyRunner:
             # -- Losses
             for key, value in locs["loss_dict"].items():
                 log_string += f"""{f'Mean {key} loss:':>{pad}} {value:.4f}\n"""
+            if dz_vm is not None:
+                log_string += f"""{f'Uncertainty dz_var_mean:':>{pad}} {dz_vm:.6f}\n"""
+                log_string += f"""{f'Uncertainty dz_var_max:':>{pad}} {dz_vx:.6f}\n"""
+                log_string += f"""{f'Uncertainty dz_mean:':>{pad}} {dz_m:.6f}\n"""
             # -- Rewards
             if self.alg.rnd:
                 log_string += (
@@ -432,6 +448,10 @@ class OnPolicyRunner:
             )
             for key, value in locs["loss_dict"].items():
                 log_string += f"""{f'{key}:':>{pad}} {value:.4f}\n"""
+            if dz_vm is not None:
+                log_string += f"""{f'Uncertainty dz_var_mean:':>{pad}} {dz_vm:.6f}\n"""
+                log_string += f"""{f'Uncertainty dz_var_max:':>{pad}} {dz_vx:.6f}\n"""
+                log_string += f"""{f'Uncertainty dz_mean:':>{pad}} {dz_m:.6f}\n"""
 
         log_string += ep_string
         log_string += (
