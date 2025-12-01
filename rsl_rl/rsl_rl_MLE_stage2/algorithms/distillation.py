@@ -81,10 +81,22 @@ class Distillation:
                 param.requires_grad_(True)
             self.student_parameters.extend(p for p in policy_head.parameters())
 
+        # 3. Teacher Critic parameters
+        self.teacher_critic_parameters: list[nn.Parameter] = []
+        if hasattr(self.policy, "teacher") and hasattr(self.policy.teacher, "critic"):
+             # Enable gradients for critic
+             for param in self.policy.teacher.critic.parameters():
+                 param.requires_grad_(True)
+             self.teacher_critic_parameters.extend(p for p in self.policy.teacher.critic.parameters())
+
         if not self.student_parameters:
             raise ValueError("No student parameters found to optimise.")
 
         self.optimizer = optim.Adam(self.student_parameters, lr=learning_rate)
+        if self.teacher_critic_parameters:
+            self.critic_optimizer = optim.Adam(self.teacher_critic_parameters, lr=learning_rate)
+        else:
+            self.critic_optimizer = None
         self.transition = RolloutStorage.Transition()
 
         # PPO / RL parameters
@@ -165,6 +177,7 @@ class Distillation:
         mean_mle_loss = 0.0
         mean_bc_loss = 0.0
         mean_surrogate_loss = 0.0
+        mean_value_loss = 0.0
         
         # Latent statistics
         mean_student_mean_norm = 0.0
@@ -244,21 +257,50 @@ class Distillation:
                 # Student action (mu_batch) vs Teacher action (privileged_actions_batch)
                 bc_loss = F.mse_loss(mu_batch, privileged_actions_batch)
 
+                # 8. Value Loss (Teacher Critic)
+                if self.critic_optimizer is not None:
+                    value_batch = self.policy.teacher.evaluate(privileged_obs_batch)
+                    # Value function loss
+                    if self.use_clipped_value_loss:
+                        value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
+                            -self.clip_param, self.clip_param
+                        )
+                        value_losses = (value_batch - returns_batch).pow(2)
+                        value_losses_clipped = (value_clipped - returns_batch).pow(2)
+                        value_loss = torch.max(value_losses, value_losses_clipped).mean()
+                    else:
+                        value_loss = (returns_batch - value_batch).pow(2).mean()
+                else:
+                    value_loss = torch.tensor(0.0, device=self.device)
+
                 # Total Loss
                 # mle_loss affects encoder
                 # surrogate_loss + bc_loss affects policy head (due to detach)
                 loss = surrogate_loss + self.bc_loss_coef * bc_loss + mle_loss - self.entropy_coef * entropy_batch.mean()
+                
+                if self.critic_optimizer is not None:
+                    loss += self.value_loss_coef * value_loss
 
                 # Gradient step
                 self.optimizer.zero_grad()
+                if self.critic_optimizer is not None:
+                    self.critic_optimizer.zero_grad()
+                
                 loss.backward()
+                
                 nn.utils.clip_grad_norm_(self.student_parameters, self.max_grad_norm)
+                if self.teacher_critic_parameters:
+                    nn.utils.clip_grad_norm_(self.teacher_critic_parameters, self.max_grad_norm)
+                
                 self.optimizer.step()
+                if self.critic_optimizer is not None:
+                    self.critic_optimizer.step()
 
                 # Logging
                 mean_mle_loss += mle_loss.item()
                 mean_bc_loss += bc_loss.item()
                 mean_surrogate_loss += surrogate_loss.item()
+                mean_value_loss += value_loss.item()
                 gen_cnt += 1
                 
                 # Debug stats
@@ -280,6 +322,7 @@ class Distillation:
         mean_mle_loss /= num_updates
         mean_bc_loss /= num_updates
         mean_surrogate_loss /= num_updates
+        mean_value_loss /= num_updates
         mean_student_mean_norm /= num_updates
         mean_student_sigma_mean /= num_updates
         mean_teacher_mean_norm /= num_updates
@@ -306,6 +349,7 @@ class Distillation:
             "mle_loss": mean_mle_loss,
             "bc_loss": mean_bc_loss,
             "surrogate_loss": mean_surrogate_loss,
+            "value_function": mean_value_loss,
             "latent/student_mean_norm": mean_student_mean_norm,
             "latent/student_uncertainty": mean_student_sigma_mean,
             "latent/teacher_mean_norm": mean_teacher_mean_norm,
