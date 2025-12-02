@@ -237,7 +237,7 @@ class TerrainAwareActorCritic(nn.Module):
             return height[..., :0]
 
         batch_shape = height.shape[:-1]
-        height_flat = height.view(-1, height_dim)
+        height_flat = height.reshape(-1, height_dim)
         height_map = height_flat.view(-1, 1, *self.height_map_shape)
         encoded = self.height_encoder(height_map)
         return encoded.view(*batch_shape, -1)

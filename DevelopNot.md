@@ -989,3 +989,44 @@ student.policy.*（学生策略头）
 std 或 log_std（动作噪声参数）
 
 resume时就可直接加载训练得到的ckpt，里面包含了教师和学生。
+
+
+
+
+
+# tensor切割报错
+
+  File "/home/lsf_storage/shared_homes/rashare/yanzhexie/State-Estimation-AMP-Lab/rsl_rl/rsl_rl_MLE_stage2/modules/terrain_aware_actor_critic.py", line 240, in _encode_height
+    height_flat = height.view(-1, height_dim)
+RuntimeError: view size is not compatible with input tensor's size and stride (at least one dimension spans across two contiguous subspaces). Use .reshape(...) instead.
+
+
+这个错误 RuntimeError: view size is not compatible with input tensor's size and stride 是因为 PyTorch 的 .view() 方法要求 Tensor 在内存中是连续的 (contiguous)。
+
+原因分析：
+
+为什么会发生？
+在你的代码中，height 变量是通过切片操作得到的：height = obs[..., -height_dim:]。
+当你在多维 Tensor 上进行切片（尤其是切最后一维）时，得到的新的 Tensor 虽然看起来形状是对的，但它在内存中可能不再是连续存储的（它的 stride 步长和形状不匹配连续内存布局）。
+例如，如果 obs 是 [Batch, ObsDim]，你取了最后一部分，那么内存中每一行的 height 数据之间会间隔着 core 数据。
+.view() 只能处理内存连续的 Tensor，遇到不连续的就会报错。
+
+为什么之前没报错？
+这通常取决于数据是如何生成的。
+
+如果你使用的是 mini_batch_generator（用于 MLP 策略），它通常会先 flatten 整个 buffer，然后用索引提取 batch。这个提取过程（Advanced Indexing）会创建数据的副本，副本是内存连续的，所以 .view() 能正常工作。
+现在你可能在使用 recurrent_mini_batch_generator（用于 RNN 策略），或者数据流发生了变化。在 RNN 的 generator 中，为了保持时间序列的完整性，通常会进行切片操作 padded_obs_trajectories[:, first_traj:last_traj]。这种切片操作保留了原始的大 Tensor 的 stride，导致取出来的 batch 在内存中是不连续的。当你再进一步切分出 height 时，不连续性依然存在。
+解决方法：
+
+使用 .reshape() 代替 .view()。
+.reshape() 更智能：如果 Tensor 已经是连续的，它就等同于 .view()（不拷贝数据）；如果 Tensor 不连续，它会自动创建一个连续的副本（copy），然后再改变形状。
+
+我已经修改了 terrain_aware_actor_critic.py 文件，将 .view(-1, height_dim) 替换为 .reshape(-1, height_dim)。
+## 修改前
+height_flat = height.view(-1, height_dim)
+
+## 修改后
+height_flat = height.reshape(-1, height_dim)
+这样可以确保无论输入数据是否连续，代码都能正常运行。
+
+Gemini 3 Pro (Preview) • 1x
