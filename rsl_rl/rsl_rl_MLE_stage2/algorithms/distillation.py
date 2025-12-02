@@ -158,19 +158,20 @@ class Distillation:
             self.policy.update_distribution(policy_input)
             self.transition.actions = self.policy.distribution.sample().detach()
             
+            if self.last_uncertainty is None:
+                self.last_uncertainty = uncertainty.detach()
+
             # --- Uncertainty Reward ---
             # 1. Absolute penalty
             unc_reward = -self.uncertainty_abs_coef * (uncertainty + self.last_uncertainty)
             
             # 2. Delta reward (improvement)
-            if self.last_uncertainty is not None:
-                delta = self.last_uncertainty - uncertainty
-                # If reset happened, delta should be 0 (or handled appropriately)
-                delta = torch.where(self.reset_uncertainty_history.unsqueeze(-1), torch.zeros_like(delta), delta)
-                # If delta is too small, set to zero
-                if delta <= self.uncertainty_delta_threshold:
-                    delta = torch.zeros_like(delta)
-                unc_reward += self.uncertainty_delta_coef * delta
+            delta = self.last_uncertainty - uncertainty
+            # If reset happened, delta should be 0 (or handled appropriately)
+            delta = torch.where(self.reset_uncertainty_history.unsqueeze(-1).bool(), torch.zeros_like(delta), delta)
+            # If delta is too small, set to zero
+            delta = torch.where(delta <= self.uncertainty_delta_threshold, torch.zeros_like(delta), delta)
+            unc_reward += self.uncertainty_delta_coef * delta
             
             self.current_unc_reward = unc_reward.detach()
             self.last_uncertainty = uncertainty.detach()
@@ -207,7 +208,7 @@ class Distillation:
         if hasattr(self, "current_unc_reward"):
              rewards += self.current_unc_reward.squeeze(-1)
         
-        self.reset_uncertainty_history = dones.clone()
+        self.reset_uncertainty_history = dones.clone().bool()
 
         # record the rewards and dones
         self.transition.rewards = rewards

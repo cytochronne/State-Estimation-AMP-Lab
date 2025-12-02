@@ -99,19 +99,19 @@ class TerrainAwareDistillationAlgorithmCfg(RslRlDistillationAlgorithmCfg):
     # adv_loss_weight = 1.0
 
     #PPO settings
-    value_loss_coef=1.0,
-    use_clipped_value_loss=True,
-    clip_param=0.2,
-    entropy_coef=0.01,
-    num_mini_batches=4,
-    schedule="adaptive",
-    gamma=0.99,
-    lam=0.95,
-    desired_kl=0.01,
-    bc_loss_coef=1.0,
-    uncertainty_delta_threshold = 0.03,
-    uncertainty_delta_coef = 2.0,
-    uncertainty_abs_coef = 1.0,
+    value_loss_coef=1.0
+    use_clipped_value_loss=True
+    clip_param=0.2
+    entropy_coef=0.01
+    num_mini_batches=4
+    schedule="adaptive"
+    gamma=0.99
+    lam=0.95
+    desired_kl=0.01
+    bc_loss_coef=1.0
+    uncertainty_delta_threshold = 0.03
+    uncertainty_delta_coef = 2.0
+    uncertainty_abs_coef = 1.0
     
 
 
