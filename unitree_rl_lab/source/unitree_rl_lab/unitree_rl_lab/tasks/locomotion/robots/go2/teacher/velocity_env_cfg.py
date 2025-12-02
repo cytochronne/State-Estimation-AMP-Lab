@@ -128,7 +128,8 @@ class RobotSceneCfg(InteractiveSceneCfg):
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
         terrain_type="generator",  # "plane", "generator"
-        terrain_generator=COBBLESTONE_ROAD_CFG,  # None, ROUGH_TERRAINS_CFG
+        # terrain_generator=COBBLESTONE_ROAD_CFG,  # None, ROUGH_TERRAINS_CFG
+        terrain_generator=STITCHED_2x2_TERRAINS_CFG,  # None, ROUGH_TERRAINS_CFG
         max_init_terrain_level=0,  # 增加最大初始地形级别以支持更广泛的课程
         collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(
@@ -249,7 +250,8 @@ class CommandsCfg:
         rel_standing_envs=0.1,
         debug_vis=True,
         ranges=mdp.UniformLevelVelocityCommandCfg.Ranges(
-            lin_vel_x=(-0.8, 0.8), lin_vel_y=(-0.3, 0.3), ang_vel_z=(-1, 1)
+            # lin_vel_x=(-0.8, 0.8), lin_vel_y=(-0.3, 0.3), ang_vel_z=(-1, 1)
+            lin_vel_x=(-3.0, 3.0), lin_vel_y=(-1.5, 1.5), ang_vel_z=(-1, 1) #play param
         ),
         limit_ranges=mdp.UniformLevelVelocityCommandCfg.Ranges(
             lin_vel_x=(-3.0, 3.0), lin_vel_y=(-1.5, 1.5), ang_vel_z=(-1.0, 1.0)

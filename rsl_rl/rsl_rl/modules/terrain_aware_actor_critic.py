@@ -316,8 +316,34 @@ class TerrainAwareActorCritic(nn.Module):
         return self.distribution.entropy().sum(dim=-1)
 
     def load_state_dict(self, state_dict, strict: bool = True):
-        super().load_state_dict(state_dict, strict=strict)
-        return True
+        try:
+            super().load_state_dict(state_dict, strict=strict)
+            return True
+        except RuntimeError as e:
+            fallback = False
+            msg = str(e)
+            if (
+                "Missing key(s) in state_dict" in msg
+                or "Unexpected key(s) in state_dict" in msg
+                or "size mismatch" in msg
+            ):
+                fallback = True
+            if fallback:
+                print("[WARN] Partial checkpoint load; falling back to non-strict state_dict load.")
+                super().load_state_dict(state_dict, strict=False)
+                try:
+                    if "actor_fusion_encoder_uncertainty" in msg and hasattr(self, "actor_fusion_encoder_uncertainty"):
+                        src = [m for m in self.actor_fusion_encoder if isinstance(m, nn.Linear)]
+                        dst = [m for m in self.actor_fusion_encoder_uncertainty if isinstance(m, nn.Linear)]
+                        if len(src) == len(dst):
+                            for a, b in zip(src, dst):
+                                b.weight.data.copy_(a.weight.data)
+                                if b.bias is not None and a.bias is not None:
+                                    b.bias.data.copy_(a.bias.data)
+                except Exception:
+                    pass
+                return False
+            raise
 
     def score_dz(self, observations):
         core, height = self._split_obs(observations, self.actor_height_dim)

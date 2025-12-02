@@ -145,6 +145,15 @@ def main():
         normalizer = policy_nn.student_obs_normalizer
     else:
         normalizer = None
+    try:
+        if normalizer is not None and hasattr(env, "unwrapped") and hasattr(env.unwrapped, "device"):
+            normalizer.to(env.unwrapped.device)
+    except Exception:
+        pass
+    try:
+        policy_device = next(policy_nn.parameters()).device
+    except Exception:
+        policy_device = env.unwrapped.device if hasattr(env, "unwrapped") and hasattr(env.unwrapped, "device") else "cpu"
 
     # export policy to onnx/jit
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
@@ -165,6 +174,25 @@ def main():
         with torch.inference_mode():
             # agent stepping
             actions = policy(obs)
+            try:
+                if hasattr(runner.alg.policy, "score_dz"):
+                    _obs = obs
+                    try:
+                        _obs = _obs.to(policy_device)
+                    except Exception:
+                        pass
+                    try:
+                        if normalizer is not None:
+                            _obs = normalizer(_obs)
+                    except Exception:
+                        pass
+                    dz_mean, dz_var, _ = runner.alg.policy.score_dz(_obs)
+                    _m = float(dz_mean.mean().item())
+                    _vm = float(dz_var.mean().item())
+                    _vx = float(dz_var.max().item())
+                    print(f"[UNCERT] dz_mean={_m:.6f} dz_var_mean={_vm:.6f} dz_var_max={_vx:.6f}", end="\r", flush=True)
+            except Exception:
+                pass
             # env stepping
             obs, _, _, _ = env.step(actions)
         if args_cli.video:
