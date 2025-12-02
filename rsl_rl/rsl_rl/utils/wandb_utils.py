@@ -42,6 +42,7 @@ class WandbSummaryWriter(SummaryWriter):
             "Policy",
             "Perf",
             "Uncertainty",
+            "UncertaintyMonitor",
             "Metrics",
             "Rnd",
             "Episode_Reward",

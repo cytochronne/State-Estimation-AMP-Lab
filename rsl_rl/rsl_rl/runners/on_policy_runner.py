@@ -24,6 +24,7 @@ from rsl_rl.modules import (
     TerrainAwareActorCritic,
 )
 from rsl_rl.utils import store_code_state
+from rsl_rl.modules.uncertainty_monitor import UncertaintyMonitorHead
 
 
 class OnPolicyRunner:
@@ -156,6 +157,33 @@ class OnPolicyRunner:
         )
         self.cfg["uncertainty_cfg"] = self.uncertainty_cfg
         self._policy_uncertainty_estimator = None
+        self.uncertainty_monitor_cfg = self.cfg.get(
+            "uncertainty_monitor_cfg",
+            {
+                "enabled": True,
+                "hidden_dims": [256, 256],
+                "dropout_rate": 0.2,
+                "learning_rate": 1.0e-3,
+                "mc_passes": 10,
+                "sample_size": 256,
+            },
+        )
+        self._uncertainty_monitor = None
+        self._uncertainty_monitor_optim = None
+        if bool(self.uncertainty_monitor_cfg.get("enabled", True)):
+            input_dim = getattr(self.alg.policy, "actor_fusion_dim", None)
+            if input_dim is None:
+                input_dim = obs.shape[1]
+            output_dim = obs.shape[1]
+            self._uncertainty_monitor = UncertaintyMonitorHead(
+                input_dim=input_dim,
+                output_dim=output_dim,
+                hidden_dims=list(self.uncertainty_monitor_cfg.get("hidden_dims", [256, 256])),
+                dropout_rate=float(self.uncertainty_monitor_cfg.get("dropout_rate", 0.2)),
+            ).to(self.device)
+            self._uncertainty_monitor_optim = torch.optim.Adam(
+                self._uncertainty_monitor.parameters(), lr=float(self.uncertainty_monitor_cfg.get("learning_rate", 1.0e-3))
+            )
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):  # noqa: C901
         # initialize writer
@@ -290,6 +318,48 @@ class OnPolicyRunner:
             # update policy
             loss_dict = self.alg.update()
 
+            if self._uncertainty_monitor is not None and self._uncertainty_monitor_optim is not None:
+                try:
+                    sample_size = int(self.uncertainty_monitor_cfg.get("sample_size", 256))
+                    obs_local = self.last_obs if self.last_obs is not None else obs
+                    if obs_local is not None:
+                        idx = torch.randperm(obs_local.shape[0], device=self.device)[: min(sample_size, obs_local.shape[0])]
+                        y_gt = obs_local[idx].detach()
+                        with torch.no_grad():
+                            if hasattr(self.alg.policy, "_prepare_features") and hasattr(self.alg.policy, "actor_fusion_encoder"):
+                                z = self.alg.policy._prepare_features(y_gt.clone(), getattr(self.alg.policy, "actor_height_dim", 0), self.alg.policy.actor_fusion_encoder)
+                            else:
+                                z = y_gt.clone()
+                        mean, log_var = self._uncertainty_monitor(z.detach())
+                        loss_elems = self._uncertainty_monitor.nll_loss(y_gt, mean, log_var)
+                        recon_loss = loss_elems.mean()
+                        self._uncertainty_monitor_optim.zero_grad()
+                        recon_loss.backward()
+                        self._uncertainty_monitor_optim.step()
+                        mc_passes = int(self.uncertainty_monitor_cfg.get("mc_passes", 10))
+                        metrics_um = self._uncertainty_monitor.predict_uncertainty(z.detach(), num_passes=mc_passes)
+                        model_var_mean = torch.mean(metrics_um["model_var"]).item()
+                        data_var_mean = torch.mean(metrics_um["data_var"]).item()
+                        total_var_mean = torch.mean(metrics_um["total_var"]).item()
+                        if self.log_dir is not None and not self.disable_logs and self.writer is not None:
+                            try:
+                                self.writer.add_scalar("UncertaintyMonitor/reconstruction_loss", float(recon_loss.item()), self.current_learning_iteration)
+                                self.writer.add_scalar("UncertaintyMonitor/model_variance_mean", float(model_var_mean), self.current_learning_iteration)
+                                self.writer.add_scalar("UncertaintyMonitor/data_variance_mean", float(data_var_mean), self.current_learning_iteration)
+                                self.writer.add_scalar("UncertaintyMonitor/total_variance_mean", float(total_var_mean), self.current_learning_iteration)
+                            except Exception:
+                                pass
+                    else:
+                        recon_loss = torch.tensor(0.0)
+                        model_var_mean = 0.0
+                        data_var_mean = 0.0
+                        total_var_mean = 0.0
+                except Exception as _e_um:
+                    recon_loss = torch.tensor(float("nan"))
+                    model_var_mean = float("nan")
+                    data_var_mean = float("nan")
+                    total_var_mean = float("nan")
+
             stop = time.time()
             learn_time = stop - start
             self.current_learning_iteration = it
@@ -351,108 +421,12 @@ class OnPolicyRunner:
         fps = int(collection_size / (locs["collection_time"] + locs["learn_time"]))
 
         uncertainty_string = ""
-        try:
-            method = str(self.uncertainty_cfg.get("method", "mc_dropout")).lower()
-            if method == "none":
-                uncertainty_string += f"""{f'Uncertainty: disabled':>{pad}}\n"""
-                if self.log_dir is not None and not self.disable_logs and self.writer is not None and self.logger_type == "wandb":
-                    self.writer.add_scalar("Uncertainty/enabled", 0, locs["it"])
-            else:
-                if self._policy_uncertainty_estimator is None:
-                    try:
-                        from uncertainty_networks.policy_uncertainty import PolicyUncertaintyEstimator
-                    except Exception as e:
-                        import sys, os
-                        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-                        cand = os.path.join(repo_root, "uncertainty-networks")
-                        if os.path.isdir(cand) and cand not in sys.path:
-                            sys.path.append(cand)
-                        from uncertainty_networks.policy_uncertainty import PolicyUncertaintyEstimator
-                    self._policy_uncertainty_estimator = PolicyUncertaintyEstimator.from_actor(
-                        self.alg.policy.actor,
-                        dropout_prob=float(self.uncertainty_cfg.get("dropout_prob", 0.1)),
-                        num_passes=int(self.uncertainty_cfg.get("num_passes", 10)),
-                        num_models=int(self.uncertainty_cfg.get("num_models", 1)),
-                        method=method,
-                        weight_noise_std=float(self.uncertainty_cfg.get("weight_noise_std", 0.0)),
-                        device=str(self.device),
-                    )
-                sample_size = int(self.uncertainty_cfg.get("sample_size", 256))
-                obs_for_est = locs.get("obs", None)
-                if obs_for_est is None:
-                    uncertainty_string += f"""{f'Uncertainty: obs missing':>{pad}}\n"""
-                    if self.log_dir is not None and not self.disable_logs and self.writer is not None and self.logger_type == "wandb":
-                        self.writer.add_scalar("Uncertainty/enabled", 0, locs["it"])
-                else:
-                    if hasattr(self.alg.policy, "_prepare_features") and hasattr(self.alg.policy, "actor_fusion_encoder"):
-                        input_tensor = self.alg.policy._prepare_features(
-                            obs_for_est.detach().clone(), getattr(self.alg.policy, "actor_height_dim", 0), self.alg.policy.actor_fusion_encoder
-                        )
-                    else:
-                        input_tensor = obs_for_est.detach().clone()
-                    try:
-                        exp_in = None
-                        m0 = self._policy_uncertainty_estimator._model._models[0]
-                        for lyr in m0:
-                            if isinstance(lyr, torch.nn.Linear):
-                                exp_in = int(lyr.in_features)
-                                break
-                        if exp_in is not None and input_tensor.shape[-1] != exp_in:
-                            if hasattr(self.alg.policy, "_prepare_features") and hasattr(self.alg.policy, "actor_fusion_encoder"):
-                                input_tensor = self.alg.policy._prepare_features(
-                                    obs_for_est.detach().clone(), getattr(self.alg.policy, "actor_height_dim", 0), self.alg.policy.actor_fusion_encoder
-                                )
-                            if input_tensor.shape[-1] != exp_in and hasattr(self.alg.policy, "_split_obs") and hasattr(self.alg.policy, "_encode_height"):
-                                core, height = self.alg.policy._split_obs(obs_for_est.detach().clone(), getattr(self.alg.policy, "actor_height_dim", 0))
-                                height_feat = self.alg.policy._encode_height(height, getattr(self.alg.policy, "actor_height_dim", 0))
-                                fusion_input = core if height_feat.numel() == 0 else torch.cat((core, height_feat), dim=-1)
-                                input_tensor = self.alg.policy.actor_fusion_encoder(fusion_input)
-                        if exp_in is not None and input_tensor.shape[-1] != exp_in:
-                            raise RuntimeError(f"feature_dim_mismatch expected={exp_in} got={input_tensor.shape[-1]}")
-                    except Exception as e_feat:
-                        raise e_feat
-                    metrics = self._policy_uncertainty_estimator.metrics(input_tensor, sample_size=sample_size)
-                    aleatoric_mean_var = None
-                    try:
-                        std = self.alg.policy.action_std
-                        aleatoric_mean_var = torch.mean(std ** 2).item()
-                    except Exception:
-                        pass
-                    uncertainty_string += f"""{f'Uncertainty mean variance:':>{pad}} {metrics['mean_variance']:.4f}\n"""
-                    uncertainty_string += f"""{f'Uncertainty max variance:':>{pad}} {metrics['max_variance']:.4f}\n"""
-                    if self.log_dir is not None and not self.disable_logs and self.writer is not None and self.logger_type == "wandb":
-                        self.writer.add_scalar("Uncertainty/enabled", 1, locs["it"])
-                        self.writer.add_scalar("Uncertainty/mean_variance", metrics["mean_variance"], locs["it"])
-                        self.writer.add_scalar("Uncertainty/max_variance", metrics["max_variance"], locs["it"])
-                        if aleatoric_mean_var is not None:
-                            self.writer.add_scalar("Uncertainty/aleatoric_mean_variance", aleatoric_mean_var, locs["it"]) 
-                            self.writer.add_scalar("Uncertainty/predictive_mean_variance", metrics["mean_variance"] + aleatoric_mean_var, locs["it"]) 
-                        for idx, v in enumerate(metrics["per_action_mean_variance"]):
-                            self.writer.add_scalar(f"Uncertainty/action_{idx}_mean_variance", float(v), locs["it"])
-                            if aleatoric_mean_var is not None and hasattr(self.alg.policy, "action_std"):
-                                try:
-                                    std = self.alg.policy.action_std
-                                    if std.ndim == 2:
-                                        alea_per_action = torch.mean(std ** 2, dim=0).detach().cpu().numpy().tolist()
-                                        if idx < len(alea_per_action):
-                                            self.writer.add_scalar(f"Uncertainty/action_{idx}_predictive_mean_variance", float(v) + float(alea_per_action[idx]), locs["it"]) 
-                                except Exception:
-                                    pass
-        except Exception as e:
-            msg = f"Uncertainty logging failed: {type(e).__name__}: {e}"
-            print(msg)
-            uncertainty_string += f"""{f'Uncertainty error:':>{pad}} {type(e).__name__}\n"""
-            if self.log_dir is not None and not self.disable_logs and self.writer is not None and self.logger_type == "wandb":
-                try:
-                    self.writer.add_scalar("Uncertainty/enabled", 0, locs["it"])
-                except Exception:
-                    pass
 
         # -- Losses
-        self.writer.add_scalar("Train/iteration", locs["it"], locs["it"]) 
+        self.writer.add_scalar("Train/iteration", locs["it"], locs["it"])
         for key, value in locs["loss_dict"].items():
             self.writer.add_scalar(f"Loss/{key}", value, locs["it"])
-        self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"]) 
+        self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
 
         # -- Policy
         self.writer.add_scalar("Policy/mean_noise_std", mean_std.item(), locs["it"])
@@ -465,20 +439,9 @@ class OnPolicyRunner:
         dz_vm = None
         dz_vx = None
         dz_m = None
-        try:
-            if hasattr(self.alg.policy, "score_dz") and self.last_obs is not None:
-                _obs = self.last_obs.clone()
-                with torch.no_grad():
-                    dz_mean, dz_var, _ = self.alg.policy.score_dz(_obs)
-                dz_vm = dz_var.mean().item()
-                dz_vx = dz_var.max().item()
-                dz_m = dz_mean.mean().item()
-                self.writer.add_scalar("Uncertainty/dz_var_mean", dz_vm, locs["it"]) 
-                self.writer.add_scalar("Uncertainty/dz_var_max", dz_vx, locs["it"]) 
-                self.writer.add_scalar("Uncertainty/dz_mean", dz_m, locs["it"]) 
-                self.writer.add_scalar("Uncertainty/dz_var_std", math.sqrt(dz_vm), locs["it"]) 
-        except Exception as _e:
-            print(f"[WARN] Uncertainty logging failed: {type(_e).__name__}: {_e}")
+        dz_vm = None
+        dz_vx = None
+        dz_m = None
 
         # -- Training
         if len(locs["rewbuffer"]) > 0:
@@ -573,6 +536,15 @@ class OnPolicyRunner:
                 log_string += f"""{f'Uncertainty dz_var_mean:':>{pad}} {dz_vm:.6f}\n"""
                 log_string += f"""{f'Uncertainty dz_var_max:':>{pad}} {dz_vx:.6f}\n"""
                 log_string += f"""{f'Uncertainty dz_mean:':>{pad}} {dz_m:.6f}\n"""
+            # -- UncertaintyMonitor
+            try:
+                if "recon_loss" in locs and "total_var_mean" in locs:
+                    log_string += f"""{f'UM recon_loss:':>{pad}} {float(locs['recon_loss'].item() if hasattr(locs['recon_loss'], 'item') else locs['recon_loss']):.6f}\n"""
+                    log_string += f"""{f'UM total_var_mean:':>{pad}} {float(locs['total_var_mean']):.6f}\n"""
+                    log_string += f"""{f'UM model_var_mean:':>{pad}} {float(locs['model_var_mean']):.6f}\n"""
+                    log_string += f"""{f'UM data_var_mean:':>{pad}} {float(locs['data_var_mean']):.6f}\n"""
+            except Exception:
+                pass
             # -- Rewards
             if self.alg.rnd:
                 log_string += (
@@ -594,6 +566,14 @@ class OnPolicyRunner:
             for key, value in locs["loss_dict"].items():
                 log_string += f"""{f'{key}:':>{pad}} {value:.4f}\n"""
             log_string += uncertainty_string
+            try:
+                if "recon_loss" in locs and "total_var_mean" in locs:
+                    log_string += f"""{f'UM recon_loss:':>{pad}} {float(locs['recon_loss'].item() if hasattr(locs['recon_loss'], 'item') else locs['recon_loss']):.6f}\n"""
+                    log_string += f"""{f'UM total_var_mean:':>{pad}} {float(locs['total_var_mean']):.6f}\n"""
+                    log_string += f"""{f'UM model_var_mean:':>{pad}} {float(locs['model_var_mean']):.6f}\n"""
+                    log_string += f"""{f'UM data_var_mean:':>{pad}} {float(locs['data_var_mean']):.6f}\n"""
+            except Exception:
+                pass
             log_string += lin_vel_string
 
         log_string += ep_string
@@ -620,6 +600,10 @@ class OnPolicyRunner:
             "iter": self.current_learning_iteration,
             "infos": infos,
         }
+        if self._uncertainty_monitor is not None:
+            saved_dict["unc_monitor_state_dict"] = self._uncertainty_monitor.state_dict()
+        if self._uncertainty_monitor_optim is not None:
+            saved_dict["unc_monitor_optim_state_dict"] = self._uncertainty_monitor_optim.state_dict()
         # -- Save RND model if used
         if self.alg.rnd:
             saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
@@ -662,6 +646,16 @@ class OnPolicyRunner:
             # -- RND optimizer if used
             if self.alg.rnd:
                 self.alg.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
+        if "unc_monitor_state_dict" in loaded_dict and self._uncertainty_monitor is not None:
+            try:
+                self._uncertainty_monitor.load_state_dict(loaded_dict["unc_monitor_state_dict"])
+            except Exception:
+                pass
+        if load_optimizer and resumed_training and "unc_monitor_optim_state_dict" in loaded_dict and self._uncertainty_monitor_optim is not None:
+            try:
+                self._uncertainty_monitor_optim.load_state_dict(loaded_dict["unc_monitor_optim_state_dict"])
+            except Exception:
+                pass
         # -- load current learning iteration
         if resumed_training:
             self.current_learning_iteration = loaded_dict["iter"]

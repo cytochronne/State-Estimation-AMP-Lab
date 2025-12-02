@@ -1,58 +1,39 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
-# All rights reserved.
-#
-# SPDX-License-Identifier: BSD-3-Clause
-
-"""Script to play a checkpoint if an RL agent from RSL-RL."""
-
-"""Launch Isaac Sim Simulator first."""
-
 import argparse
 from importlib.metadata import version
 
 from isaaclab.app import AppLauncher
 
-# local imports
-import cli_args  # isort: skip
+import cli_args  
 
-# add argparse arguments
-parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
+parser = argparse.ArgumentParser(description="Play RSL-RL agent with MC Dropout uncertainty.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
-parser.add_argument(
-    "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
-)
+parser.add_argument("--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations.")
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
-parser.add_argument(
-    "--use_pretrained_checkpoint",
-    action="store_true",
-    help="Use the pre-trained checkpoint from Nucleus.",
-)
+parser.add_argument("--use_pretrained_checkpoint", action="store_true", help="Use the pre-trained checkpoint from Nucleus.")
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
-# append RSL-RL cli arguments
+parser.add_argument("--mc_passes", type=int, default=10, help="Number of MC Dropout forward passes per frame.")
+parser.add_argument("--mc_dropout_prob", type=float, default=0.1, help="Dropout probability used for MC sampling.")
+parser.add_argument("--ci_alpha", type=float, default=0.95, help="Confidence level for CI output.")
 cli_args.add_rsl_rl_args(parser)
-# append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
-# always enable cameras to record video
 if args_cli.video:
     args_cli.enable_cameras = True
 
-# launch omniverse app
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
-
-"""Rest everything follows."""
 
 import gymnasium as gym
 import os
 import time
+import math
 import torch
 
 from rsl_rl.runners import OnPolicyRunner
 
-import isaaclab_tasks  # noqa: F401
+import isaaclab_tasks  
 from isaaclab.envs import DirectMARLEnv, multi_agent_to_single_agent
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
@@ -60,13 +41,19 @@ from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkp
 from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper, export_policy_as_jit, export_policy_as_onnx
 from isaaclab_tasks.utils import get_checkpoint_path
 
-import unitree_rl_lab.tasks  # noqa: F401
+import unitree_rl_lab.tasks  
 from unitree_rl_lab.utils.parser_cfg import parse_env_cfg
 
 
+def _prepare_actor_input(policy_module, obs_tensor):
+    if hasattr(policy_module, "_prepare_features") and hasattr(policy_module, "actor_fusion_encoder"):
+        return policy_module._prepare_features(
+            obs_tensor.detach().clone(), getattr(policy_module, "actor_height_dim", 0), policy_module.actor_fusion_encoder
+        )
+    return obs_tensor.detach().clone()
+
+
 def main():
-    """Play with RSL-RL agent."""
-    # parse configuration
     env_cfg = parse_env_cfg(
         args_cli.task,
         device=args_cli.device,
@@ -76,7 +63,6 @@ def main():
     )
     agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
 
-    # specify directory for logging experiments
     log_root_path = os.path.join(args_cli.log_root, "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
     print(f"[INFO] Loading experiment from directory: {log_root_path}")
@@ -92,14 +78,10 @@ def main():
 
     log_dir = os.path.dirname(resume_path)
 
-    # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
-
-    # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
 
-    # wrap for video recording
     if args_cli.video:
         video_kwargs = {
             "video_folder": os.path.join(log_dir, "videos", "play"),
@@ -111,107 +93,78 @@ def main():
         print_dict(video_kwargs, nesting=4)
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
-    # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-    # load previously trained model
-    if not hasattr(agent_cfg, "class_name") or agent_cfg.class_name == "OnPolicyRunner":
-        runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    elif agent_cfg.class_name == "DistillationRunner":
-        from rsl_rl.runners import DistillationRunner
-
-        runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    else:
-        raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
+    runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     runner.load(resume_path)
 
-    # obtain the trained policy for inference
-    policy = runner.get_inference_policy(device=env.unwrapped.device)
+    policy_infer = runner.get_inference_policy(device=env.unwrapped.device)
 
-    # extract the neural network module
-    # we do this in a try-except to maintain backwards compatibility.
     try:
-        # version 2.3 onwards
         policy_nn = runner.alg.policy
     except AttributeError:
-        # version 2.2 and below
         policy_nn = runner.alg.actor_critic
 
-    # extract the normalizer
     if hasattr(policy_nn, "actor_obs_normalizer"):
         normalizer = policy_nn.actor_obs_normalizer
     elif hasattr(policy_nn, "student_obs_normalizer"):
         normalizer = policy_nn.student_obs_normalizer
     else:
         normalizer = None
-    try:
-        if normalizer is not None and hasattr(env, "unwrapped") and hasattr(env.unwrapped, "device"):
-            normalizer.to(env.unwrapped.device)
-    except Exception:
-        pass
-    try:
-        policy_device = next(policy_nn.parameters()).device
-    except Exception:
-        policy_device = env.unwrapped.device if hasattr(env, "unwrapped") and hasattr(env.unwrapped, "device") else "cpu"
 
-    # export policy to onnx/jit
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
     export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
     export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
 
     dt = env.unwrapped.step_dt
 
-    # reset environment
-    obs = env.get_observations()
+    ret = env.get_observations()
     if version("rsl-rl-lib").startswith("2.3."):
-        obs, _ = env.get_observations()
+        obs, extras = ret
+    else:
+        obs = ret
+        extras = {}
+
+    mc_passes = int(getattr(args_cli, "mc_passes", 10) or 10)
+
     timestep = 0
-    # simulate environment
     while simulation_app.is_running():
         start_time = time.time()
-        # run everything in inference mode
         with torch.inference_mode():
-            # agent stepping
-            actions = policy(obs)
-            try:
-                if hasattr(runner.alg.policy, "score_dz"):
-                    _obs = obs
-                    try:
-                        _obs = _obs.to(policy_device)
-                    except Exception:
-                        pass
-                    try:
-                        if normalizer is not None:
-                            _obs = normalizer(_obs)
-                    except Exception:
-                        pass
-                    dz_mean, dz_var, _ = runner.alg.policy.score_dz(_obs)
-                    _m = float(dz_mean.mean().item())
-                    _vm = float(dz_var.mean().item())
-                    _vx = float(dz_var.max().item())
-                    print(f"[UNCERT] dz_mean={_m:.6f} dz_var_mean={_vm:.6f} dz_var_max={_vx:.6f}", end="\r", flush=True)
-            except Exception:
-                pass
-            # env stepping
-            obs, _, _, _ = env.step(actions)
+            actions = policy_infer(obs)
+            ret = env.step(actions)
+            if version("rsl-rl-lib").startswith("2.3."):
+                obs, _, _, extras = ret
+            else:
+                obs, _, _, extras = ret
+
+            runner.alg.policy.actor.train()
+            input_tensor = _prepare_actor_input(runner.alg.policy, obs)
+            um = getattr(runner, "_uncertainty_monitor", None)
+            if um is not None:
+                um_metrics = um.predict_uncertainty(input_tensor.detach(), num_passes=mc_passes)
+                um_total = float(torch.mean(um_metrics["total_var"]).item())
+                um_model = float(torch.mean(um_metrics["model_var"]).item())
+                um_data = float(torch.mean(um_metrics["data_var"]).item())
+                msg = f"ReconVar(mean): {um_total:.4f} (model {um_model:.4f}, data {um_data:.4f}) | Samples: {mc_passes}"
+            else:
+                msg = f"ReconVar(mean): N/A | Samples: {mc_passes}"
+            print(msg, end="\r")
+            runner.alg.policy.actor.eval()
+
         if args_cli.video:
             timestep += 1
-            # Exit the play loop after recording one video
             if timestep == args_cli.video_length:
                 break
 
-        # time delay for real-time evaluation
         sleep_time = dt - (time.time() - start_time)
         if args_cli.real_time and sleep_time > 0:
             time.sleep(sleep_time)
 
-    # close the simulator
     env.close()
 
 
 if __name__ == "__main__":
-    # run the main function
     main()
-    # close sim app
     simulation_app.close()
