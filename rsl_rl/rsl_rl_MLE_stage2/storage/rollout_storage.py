@@ -133,13 +133,19 @@ class RolloutStorage:
             self.saved_hidden_states_a = [
                 torch.zeros(self.observations.shape[0], *hid_a[i].shape, device=self.device) for i in range(len(hid_a))
             ]
-            self.saved_hidden_states_c = [
-                torch.zeros(self.observations.shape[0], *hid_c[i].shape, device=self.device) for i in range(len(hid_c))
-            ]
+            if hid_c[0] is not None:
+                self.saved_hidden_states_c = [
+                    torch.zeros(self.observations.shape[0], *hid_c[i].shape, device=self.device) for i in range(len(hid_c))
+                ]
+            else:
+                self.saved_hidden_states_c = None
         # copy the states
         for i in range(len(hid_a)):
             self.saved_hidden_states_a[i][self.step].copy_(hid_a[i])
-            self.saved_hidden_states_c[i][self.step].copy_(hid_c[i])
+        
+        if self.saved_hidden_states_c is not None:
+            for i in range(len(hid_c)):
+                self.saved_hidden_states_c[i][self.step].copy_(hid_c[i])
 
     def clear(self):
         self.step = 0
@@ -303,15 +309,21 @@ class RolloutStorage:
                     .contiguous()
                     for saved_hidden_states in self.saved_hidden_states_a
                 ]
-                hid_c_batch = [
-                    saved_hidden_states.permute(2, 0, 1, 3)[last_was_done][first_traj:last_traj]
-                    .transpose(1, 0)
-                    .contiguous()
-                    for saved_hidden_states in self.saved_hidden_states_c
-                ]
+                
+                if self.saved_hidden_states_c is not None:
+                    hid_c_batch = [
+                        saved_hidden_states.permute(2, 0, 1, 3)[last_was_done][first_traj:last_traj]
+                        .transpose(1, 0)
+                        .contiguous()
+                        for saved_hidden_states in self.saved_hidden_states_c
+                    ]
+                else:
+                    hid_c_batch = None
+
                 # remove the tuple for GRU
                 hid_a_batch = hid_a_batch[0] if len(hid_a_batch) == 1 else hid_a_batch
-                hid_c_batch = hid_c_batch[0] if len(hid_c_batch) == 1 else hid_c_batch
+                if hid_c_batch is not None:
+                    hid_c_batch = hid_c_batch[0] if len(hid_c_batch) == 1 else hid_c_batch
 
                 yield obs_batch, privileged_obs_batch, actions_batch, values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
                     hid_a_batch,

@@ -20,7 +20,7 @@ from rsl_rl_MLE_stage2.utils import resolve_nn_activation
 class TerrainAwareStudentTeacher(nn.Module):
     """Student-teacher module with a terrain-aware teacher and recurrent student."""
 
-    is_recurrent = False
+    is_recurrent = True
 
     def __init__(
         self,

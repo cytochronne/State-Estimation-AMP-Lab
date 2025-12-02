@@ -158,6 +158,9 @@ class Distillation:
             self.policy.update_distribution(policy_input)
             self.transition.actions = self.policy.distribution.sample().detach()
             
+            if self.policy.is_recurrent:
+                self.transition.hidden_states = self.policy.get_hidden_states()
+
             if self.last_uncertainty is None:
                 self.last_uncertainty = uncertainty.detach()
 
@@ -247,7 +250,7 @@ class Distillation:
             privileged_actions_batch in generator:
 
                 # 1. Compute Latent (Encoder)
-                student_mean, student_var = self.policy.get_student_latent(obs_batch, masks=masks_batch, hidden_states=hid_states_batch)
+                student_mean, student_var = self.policy.get_student_latent(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
                 
                 # 2. MLE Loss (Encoder update only)
                 with torch.no_grad():
