@@ -41,6 +41,25 @@ def add_rsl_rl_args(parser: argparse.ArgumentParser):
         "--log_root", type=str, default="logs", help="Root folder for logs"
     )
 
+    # uncertainty logging arguments (aligned with rsl_rl group)
+    arg_group.add_argument(
+        "--uncertainty_method",
+        type=str,
+        default="mc_dropout",
+        choices={"mc_dropout", "ensemble", "mc_ensemble", "none"},
+        help="Uncertainty estimation method for logging",
+    )
+    arg_group.add_argument("--uncertainty_num_passes", type=int, default=10, help="MC passes per model")
+    arg_group.add_argument("--uncertainty_num_models", type=int, default=1, help="Number of ensemble models")
+    arg_group.add_argument("--uncertainty_dropout", type=float, default=0.1, help="Dropout probability")
+    arg_group.add_argument(
+        "--uncertainty_weight_noise_std",
+        type=float,
+        default=0.0,
+        help="Std of Gaussian noise added to ensemble weights",
+    )
+    arg_group.add_argument("--uncertainty_sample_size", type=int, default=256, help="Sample size for logging")
+
 
 def parse_rsl_rl_cfg(task_name: str, args_cli: argparse.Namespace) -> RslRlOnPolicyRunnerCfg:
     """Parse configuration for RSL-RL agent based on inputs.
@@ -96,5 +115,21 @@ def update_rsl_rl_cfg(agent_cfg: RslRlOnPolicyRunnerCfg, args_cli: argparse.Name
     if agent_cfg.experiment_name == "":
         task_name = args_cli.task
         agent_cfg.experiment_name = task_name.lower().replace("-", "_").removesuffix("_play")
+
+    # propagate uncertainty config
+    uc = getattr(agent_cfg, "uncertainty_cfg", None) or {}
+    if hasattr(args_cli, "uncertainty_method") and args_cli.uncertainty_method is not None:
+        uc["method"] = args_cli.uncertainty_method
+    if hasattr(args_cli, "uncertainty_num_passes") and args_cli.uncertainty_num_passes is not None:
+        uc["num_passes"] = args_cli.uncertainty_num_passes
+    if hasattr(args_cli, "uncertainty_num_models") and args_cli.uncertainty_num_models is not None:
+        uc["num_models"] = args_cli.uncertainty_num_models
+    if hasattr(args_cli, "uncertainty_dropout") and args_cli.uncertainty_dropout is not None:
+        uc["dropout_prob"] = args_cli.uncertainty_dropout
+    if hasattr(args_cli, "uncertainty_weight_noise_std") and args_cli.uncertainty_weight_noise_std is not None:
+        uc["weight_noise_std"] = args_cli.uncertainty_weight_noise_std
+    if hasattr(args_cli, "uncertainty_sample_size") and args_cli.uncertainty_sample_size is not None:
+        uc["sample_size"] = args_cli.uncertainty_sample_size
+    setattr(agent_cfg, "uncertainty_cfg", uc)
 
     return agent_cfg

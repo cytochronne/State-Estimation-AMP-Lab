@@ -74,6 +74,16 @@ class BasePPORunnerCfg(RslRlOnPolicyRunnerCfg):
         max_grad_norm=1.0,
     )
 
+    # default uncertainty logging configuration
+    uncertainty_cfg = {
+        "method": "mc_dropout",
+        "dropout_prob": 0.1,
+        "num_passes": 10,
+        "num_models": 1,
+        "weight_noise_std": 0.0,
+        "sample_size": 256,
+    }
+
 
 @configclass
 class TerrainAwarePPORunnerCfg(BasePPORunnerCfg):

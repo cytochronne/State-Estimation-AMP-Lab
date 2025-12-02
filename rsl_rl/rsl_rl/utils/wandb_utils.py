@@ -34,9 +34,21 @@ class WandbSummaryWriter(SummaryWriter):
         except KeyError:
             entity = None
 
-        # Initialize wandb run
-        self._run = wandb.init(project=project, entity=entity, name=run_name, mode="online")
-        self._run.define_metric("*", step_metric="iteration")
+        # Initialize wandb in offline mode
+        wandb.init(project=project, entity=entity, name=run_name, mode="online")
+        for prefix in [
+            "Train",
+            "Loss",
+            "Policy",
+            "Perf",
+            "Uncertainty",
+            "Metrics",
+            "Rnd",
+            "Episode_Reward",
+            "Episode_Termination",
+            "Curriculum",
+        ]:
+            wandb.run.define_metric(f"{prefix}/*", step_metric="Train/iteration")
 
         # Add log directory to wandb
         wandb.config.update({"log_dir": log_dir})
@@ -44,6 +56,8 @@ class WandbSummaryWriter(SummaryWriter):
         self.name_map = {
             "Train/mean_reward/time": "Train/mean_reward_time",
             "Train/mean_episode_length/time": "Train/mean_episode_length_time",
+            "Uncertainty/mean_variance": "Uncertainty/mean_variance",
+            "Uncertainty/max_variance": "Uncertainty/max_variance",
         }
 
     def store_config(self, env_cfg, runner_cfg, alg_cfg, policy_cfg):
@@ -63,12 +77,12 @@ class WandbSummaryWriter(SummaryWriter):
             walltime=walltime,
             new_style=new_style,
         )
-        # 使用训练轮次 iteration 作为统一的X轴
         step = int(global_step) if global_step is not None else None
         payload = {self._map_path(tag): scalar_value}
         if step is not None:
-            payload["iteration"] = step
+            payload["Train/iteration"] = step
         wandb.log(payload)
+
     def stop(self):
         wandb.finish()
 
