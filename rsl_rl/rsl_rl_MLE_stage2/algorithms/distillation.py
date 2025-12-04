@@ -124,6 +124,9 @@ class Distillation:
         self.last_uncertainty = None
         self.reset_uncertainty_history = None
 
+        self.accumulated_unc_reward = 0.0
+        self.accumulated_unc_reward_count = 0
+
         self.num_updates = 0
 
     def init_storage(
@@ -160,7 +163,7 @@ class Distillation:
             
             if self.policy.is_recurrent:
                 self.transition.hidden_states = self.policy.get_hidden_states()
-
+            
             if self.last_uncertainty is None:
                 self.last_uncertainty = uncertainty.detach()
 
@@ -196,10 +199,7 @@ class Distillation:
 
         # 2. Teacher acts (for BC target)
         # We need teacher's action for BC loss
-        if hasattr(self.policy, "teacher"):
-             self.transition.privileged_actions = self.policy.teacher.act_inference(teacher_obs).detach()
-        else:
-             self.transition.privileged_actions = self.policy.evaluate(teacher_obs).detach() # This might be wrong if evaluate returns value
+        self.transition.privileged_actions = self.policy.evaluate(teacher_obs).detach() 
 
         # record the observations
         self.transition.observations = obs
@@ -210,6 +210,8 @@ class Distillation:
         # Add uncertainty reward
         if hasattr(self, "current_unc_reward"):
              rewards += self.current_unc_reward.squeeze(-1)
+             self.accumulated_unc_reward += self.current_unc_reward.mean().item()
+             self.accumulated_unc_reward_count += 1
         
         self.reset_uncertainty_history = dones.clone().bool()
 
@@ -227,6 +229,8 @@ class Distillation:
         mean_bc_loss = 0.0
         mean_surrogate_loss = 0.0
         mean_value_loss = 0.0
+        mean_bc_weight = 0.0
+        mean_uncertainty = 0.0
         
         # Latent statistics
         mean_student_mean_norm = 0.0
@@ -250,11 +254,29 @@ class Distillation:
             privileged_actions_batch in generator:
 
                 # 1. Compute Latent (Encoder)
+                print("INFO: obs_batch_shape:", obs_batch.shape)
+                print("INFO: privileged_obs_batch_shape:", privileged_obs_batch.shape)
+                print("INFO: actions_batch_shape:", actions_batch.shape)
+                print("INFO: privileged_actions_batch_shape:", privileged_actions_batch.shape)
+                print("INFO: target_values_batch_shape:", target_values_batch.shape)
+                print("INFO: advantages_batch_shape:", advantages_batch.shape)
+                print("INFO: returns_batch_shape:", returns_batch.shape)
+                print("INFO: old_actions_log_prob_batch_shape:", old_actions_log_prob_batch.shape)
+                print("INFO: old_mu_batch_shape:", old_mu_batch.shape)
+                print("INFO: old_sigma_batch_shape:", old_sigma_batch.shape)
+
+                
+
+
                 student_mean, student_var = self.policy.get_student_latent(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
                 
                 # 2. MLE Loss (Encoder update only)
                 with torch.no_grad():
                     teacher_latent = self.policy.evaluate_feature(privileged_obs_batch)
+                print("INFO: student_latent_shape:", student_mean.shape)
+                print("INFO: student_var_shape:", student_var.shape)
+                print("INFO: teacher_latent_shape:", teacher_latent.shape)
+
                 mle_loss = F.gaussian_nll_loss(student_mean, teacher_latent, student_var)
 
                 # 3. Detach Latent for Policy Head (Stop gradient from RL/BC to Encoder)
@@ -272,7 +294,7 @@ class Distillation:
                 mu_batch = self.policy.action_mean
                 sigma_batch = self.policy.action_std
                 entropy_batch = self.policy.entropy
-
+                
                 # 6. PPO Loss (Surrogate)
                 # Adaptive LR / KL
                 if self.desired_kl is not None and self.schedule == "adaptive":
@@ -314,6 +336,9 @@ class Distillation:
                 
                 # Weighted BC loss
                 bc_loss = (bc_loss_raw * bc_weight).mean()
+
+                mean_bc_weight += bc_weight.mean().item()
+                mean_uncertainty += uncertainty_batch.mean().item()
 
                 # 8. Value Loss (Teacher Critic)
                 if self.critic_optimizer is not None:
@@ -384,6 +409,16 @@ class Distillation:
         mean_student_mean_norm /= num_updates
         mean_student_sigma_mean /= num_updates
         mean_teacher_mean_norm /= num_updates
+        mean_bc_weight /= num_updates
+        mean_uncertainty /= num_updates
+
+        if self.accumulated_unc_reward_count > 0:
+            mean_unc_reward = self.accumulated_unc_reward / self.accumulated_unc_reward_count
+        else:
+            mean_unc_reward = 0.0
+        
+        self.accumulated_unc_reward = 0.0
+        self.accumulated_unc_reward_count = 0
 
         self.storage.clear()
 
@@ -411,6 +446,9 @@ class Distillation:
             "latent/student_mean_norm": mean_student_mean_norm,
             "latent/student_uncertainty": mean_student_sigma_mean,
             "latent/teacher_mean_norm": mean_teacher_mean_norm,
+            "distillation/mean_unc_reward": mean_unc_reward,
+            "distillation/mean_uncertainty": mean_uncertainty,
+            "distillation/mean_bc_weight": mean_bc_weight,
         }
 
         return loss_dict

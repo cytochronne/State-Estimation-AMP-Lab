@@ -361,6 +361,10 @@ tensor([[4,4,4,4],
 
 prepare_features里的observation是经过padding的吗
 
+
+
+![alt text](image.png)
+
 # 观察与extras
 先给你一个结论版，然后再一点点拆开👇
 

@@ -266,6 +266,13 @@ class RolloutStorage:
             padded_rnd_state_trajectories, _ = split_and_pad_trajectories(self.rnd_state, self.dones)
         else:
             padded_rnd_state_trajectories = None
+        print("====================INFO IN recurrent_mini_batch_generator ==============================")
+        print("INFO: original_obs_shape:", self.observations.shape)
+        print("INFO: padded_obs_trajectories_shape:", padded_obs_trajectories.shape)
+        print("INFO: trajectory_masks_shape:", trajectory_masks.shape)
+        print("INFO: privileged_obs_shape:", self.privileged_observations.shape if self.privileged_observations is not None else None)
+        print("INFO: padded_privileged_obs_trajectories_shape:", padded_privileged_obs_trajectories.shape)
+        print("==========================================================================================")
 
         mini_batch_size = self.num_envs // num_mini_batches
         for ep in range(num_epochs):
@@ -283,7 +290,14 @@ class RolloutStorage:
 
                 masks_batch = trajectory_masks[:, first_traj:last_traj]
                 obs_batch = padded_obs_trajectories[:, first_traj:last_traj]
-                privileged_obs_batch = padded_privileged_obs_trajectories[:, first_traj:last_traj]
+                # --- 修改开始 ---
+                # 原代码: privileged_obs_batch = padded_privileged_obs_trajectories[:, first_traj:last_traj]
+                # 修改原因: Teacher (MLP) 需要与 actions/returns (512) 对齐，而不是与 RNN 轨迹 (526) 对齐
+                if self.privileged_observations is not None:
+                    privileged_obs_batch = self.privileged_observations[:, start:stop]
+                else:
+                    privileged_obs_batch = self.observations[:, start:stop]
+                # --- 修改结束 ---
 
                 if padded_rnd_state_trajectories is not None:
                     rnd_state_batch = padded_rnd_state_trajectories[:, first_traj:last_traj]
@@ -298,7 +312,11 @@ class RolloutStorage:
                 values_batch = self.values[:, start:stop]
                 old_actions_log_prob_batch = self.actions_log_prob[:, start:stop]
                 privileged_actions_batch = self.privileged_actions[:, start:stop]
-
+                print("INFO: actions_batch_shape_before_cut:", self.actions.shape)
+                print("INFO: actions_batch_shape:", actions_batch.shape)
+                print("INFO: values_batch_shape_before_cut:", self.values.shape)
+                print("INFO: values_batch_shape:", values_batch.shape)
+                print("==========================================================================================")
                 # reshape to [num_envs, time, num layers, hidden dim] (original shape: [time, num_layers, num_envs, hidden_dim])
                 # then take only time steps after dones (flattens num envs and time dimensions),
                 # take a batch of trajectories and finally reshape back to [num_layers, batch, hidden_dim]
