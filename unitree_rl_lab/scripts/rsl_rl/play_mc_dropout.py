@@ -126,30 +126,7 @@ def main():
         obs = ret
         extras = {}
 
-    try:
-        from uncertainty_networks.policy_uncertainty import PolicyUncertaintyEstimator
-    except Exception:
-        import sys
-        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-        cand = os.path.join(repo_root, "uncertainty-networks")
-        if os.path.isdir(cand) and cand not in sys.path:
-            sys.path.append(cand)
-        from uncertainty_networks.policy_uncertainty import PolicyUncertaintyEstimator
-
     mc_passes = int(getattr(args_cli, "mc_passes", 10) or 10)
-    mc_p = float(getattr(args_cli, "mc_dropout_prob", 0.1) or 0.1)
-    ci_alpha = float(getattr(args_cli, "ci_alpha", 0.95) or 0.95)
-    z_val = 1.96 if abs(ci_alpha - 0.95) < 1e-6 else 1.96
-
-    estimator = PolicyUncertaintyEstimator.from_actor(
-        policy_nn.actor,
-        dropout_prob=mc_p,
-        num_passes=mc_passes,
-        num_models=1,
-        method="mc_dropout",
-        weight_noise_std=0.0,
-        device=str(agent_cfg.device),
-    )
 
     timestep = 0
     while simulation_app.is_running():
@@ -164,31 +141,15 @@ def main():
 
             runner.alg.policy.actor.train()
             input_tensor = _prepare_actor_input(runner.alg.policy, obs)
-            try:
-                m0 = estimator._model._models[0]
-                exp_in = None
-                for lyr in m0:
-                    if isinstance(lyr, torch.nn.Linear):
-                        exp_in = int(lyr.in_features)
-                        break
-                if exp_in is not None and input_tensor.shape[-1] != exp_in:
-                    if hasattr(runner.alg.policy, "_split_obs") and hasattr(runner.alg.policy, "_encode_height"):
-                        core, height = runner.alg.policy._split_obs(obs.detach().clone(), getattr(runner.alg.policy, "actor_height_dim", 0))
-                        height_feat = runner.alg.policy._encode_height(height, getattr(runner.alg.policy, "actor_height_dim", 0))
-                        fusion_input = core if height_feat.numel() == 0 else torch.cat((core, height_feat), dim=-1)
-                        input_tensor = runner.alg.policy.actor_fusion_encoder(fusion_input)
-            except Exception:
-                pass
-            metrics = estimator.metrics(input_tensor, sample_size=min(input_tensor.shape[0], 256))
-            per_var = metrics.get("per_action_mean_variance", [])
-            if isinstance(per_var, torch.Tensor):
-                per_var = per_var.detach().cpu().numpy().tolist()
-            per_std = [math.sqrt(float(v)) for v in per_var] if per_var else []
-            std_mean = float(sum(per_std) / len(per_std)) if per_std else float(math.sqrt(max(metrics.get("mean_variance", 0.0), 0.0)))
-            ci_half = z_val * std_mean / math.sqrt(mc_passes) if mc_passes > 0 else float('nan')
-            ci_low = max(0.0, std_mean - ci_half) if not math.isnan(ci_half) else float('nan')
-            ci_high = std_mean + ci_half if not math.isnan(ci_half) else float('nan')
-            msg = f"MC Std(mean): {std_mean:.4f} | 95% CI: [{ci_low:.4f}, {ci_high:.4f}] | Samples: {mc_passes}"
+            um = getattr(runner, "_uncertainty_monitor", None)
+            if um is not None:
+                um_metrics = um.predict_uncertainty(input_tensor.detach(), num_passes=mc_passes)
+                um_total = float(torch.mean(um_metrics["total_var"]).item())
+                um_model = float(torch.mean(um_metrics["model_var"]).item())
+                um_data = float(torch.mean(um_metrics["data_var"]).item())
+                msg = f"ReconVar(mean): {um_total:.4f} (model {um_model:.4f}, data {um_data:.4f}) | Samples: {mc_passes}"
+            else:
+                msg = f"ReconVar(mean): N/A | Samples: {mc_passes}"
             print(msg, end="\r")
             runner.alg.policy.actor.eval()
 
