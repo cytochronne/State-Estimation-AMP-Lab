@@ -250,8 +250,8 @@ class CommandsCfg:
         rel_standing_envs=0.1,
         debug_vis=True,
         ranges=mdp.UniformLevelVelocityCommandCfg.Ranges(
-            # lin_vel_x=(-0.8, 0.8), lin_vel_y=(-0.3, 0.3), ang_vel_z=(-1, 1)
-            lin_vel_x=(-3.0, 3.0), lin_vel_y=(-1.5, 1.5), ang_vel_z=(-1, 1) #play param
+            lin_vel_x=(-0.8, 0.8), lin_vel_y=(-0.3, 0.3), ang_vel_z=(-1, 1)
+            # lin_vel_x=(-3.0, 3.0), lin_vel_y=(-1.5, 1.5), ang_vel_z=(-1, 1) #play param
         ),
         limit_ranges=mdp.UniformLevelVelocityCommandCfg.Ranges(
             lin_vel_x=(-3.0, 3.0), lin_vel_y=(-1.5, 1.5), ang_vel_z=(-1.0, 1.0)
@@ -417,7 +417,14 @@ class TerminationsCfg:
         func=mdp.illegal_contact,
         params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names="base"), "threshold": 1.0},
     )
-    bad_orientation = DoneTerm(func=mdp.bad_orientation, params={"limit_angle": 0.8})
+    base_height_rel = DoneTerm(
+        func=mdp.root_height_below_terrain,
+        params={"minimum_clearance": 0.28, "asset_cfg": SceneEntityCfg("robot"), "sensor_cfg": SceneEntityCfg("height_scanner")},
+    )
+    bad_orientation = DoneTerm(
+        func=mdp.bad_orientation_adaptive,
+        params={"base_limit": 0.8, "slope_gain": 0.5, "max_limit": 1.2, "asset_cfg": SceneEntityCfg("robot"), "sensor_cfg": SceneEntityCfg("height_scanner")},
+    )
 
 
 @configclass

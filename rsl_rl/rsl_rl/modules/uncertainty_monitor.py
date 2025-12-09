@@ -22,6 +22,7 @@ class UncertaintyMonitorHead(nn.Module):
         z = self.backbone(x)
         mean = self.mean_head(z)
         log_var = self.logvar_head(z)
+        log_var = torch.clamp(log_var, min=-10.0, max=10.0)
         return mean, log_var
 
     @staticmethod
@@ -44,4 +45,3 @@ class UncertaintyMonitorHead(nn.Module):
         model_var = (mstack.pow(2).mean(dim=0) - mstack.mean(dim=0).pow(2))
         data_var = vstack.mean(dim=0)
         return {"model_var": model_var, "data_var": data_var, "total_var": model_var + data_var}
-

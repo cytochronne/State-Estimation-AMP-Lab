@@ -334,8 +334,11 @@ class OnPolicyRunner:
                         loss_elems = self._uncertainty_monitor.nll_loss(y_gt, mean, log_var)
                         recon_loss = loss_elems.mean()
                         self._uncertainty_monitor_optim.zero_grad()
-                        recon_loss.backward()
-                        self._uncertainty_monitor_optim.step()
+                        if torch.isfinite(recon_loss):
+                            recon_loss.backward()
+                            self._uncertainty_monitor_optim.step()
+                        else:
+                            print("Uncertainty Monitor Loss Diverged, skipping update")
                         mc_passes = int(self.uncertainty_monitor_cfg.get("mc_passes", 10))
                         metrics_um = self._uncertainty_monitor.predict_uncertainty(z.detach(), num_passes=mc_passes)
                         model_var_mean = torch.mean(metrics_um["model_var"]).item()
@@ -529,6 +532,22 @@ class OnPolicyRunner:
                     'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
                 f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
             )
+            try:
+                base_env = getattr(self.env, 'unwrapped', self.env)
+                if hasattr(base_env, 'scene') and hasattr(base_env.scene, 'sensors') and 'height_scanner' in base_env.scene.sensors:
+                    sensor = base_env.scene.sensors['height_scanner']
+                    hits = sensor.data.ray_hits_w
+                    asset = base_env.scene['robot']
+                    root_xy = asset.data.root_pos_w[:, :2].unsqueeze(1)
+                    dxy = torch.norm(hits[..., :2] - root_xy, dim=-1)
+                    idx = torch.argmin(dxy, dim=1)
+                    terrain_z = hits[torch.arange(hits.shape[0], device=hits.device), idx, 2]
+                    rel_h = asset.data.root_pos_w[:, 2] - terrain_z
+                    min_rel_h = float(torch.min(rel_h).item())
+                    self.writer.add_scalar('Metrics/min_base_height_rel', min_rel_h, locs['it'])
+                    log_string += f"""{f'Min base height rel:':>{pad}} {min_rel_h:.4f}\n"""
+            except Exception:
+                pass
             # -- Losses
             for key, value in locs["loss_dict"].items():
                 log_string += f"""{f'Mean {key} loss:':>{pad}} {value:.4f}\n"""
