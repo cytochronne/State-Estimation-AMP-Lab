@@ -21,8 +21,18 @@ def bad_orientation_adaptive(env, base_limit: float, slope_gain: float, max_limi
     centered = hits - torch.mean(hits, dim=1, keepdim=True)
     denom = float(max(hits.shape[1], 1))
     cov = torch.matmul(centered.transpose(1, 2), centered) / denom
-    eigvals, eigvecs = torch.linalg.eigh(cov)
-    normal = eigvecs[:, :, 0]
+    cov = 0.5 * (cov + cov.transpose(1, 2))
+    diag = torch.diagonal(cov, dim1=1, dim2=2)
+    scale = torch.mean(diag, dim=1, keepdim=True)
+    eps = 1e-6 + 1e-3 * scale
+    I = torch.eye(cov.shape[-1], device=cov.device, dtype=cov.dtype).unsqueeze(0)
+    cov = cov + eps.unsqueeze(-1) * I
+    try:
+        eigvals, eigvecs = torch.linalg.eigh(cov)
+        normal = eigvecs[:, :, 0]
+    except RuntimeError:
+        normal = torch.zeros((cov.shape[0], 3), device=cov.device, dtype=cov.dtype)
+        normal[:, 2] = 1.0
     normal = torch.nn.functional.normalize(normal, dim=1)
     slope_angle = torch.acos(torch.clamp(normal[:, 2], -1.0, 1.0))
     limit = torch.clamp(base_limit + slope_gain * slope_angle, min=base_limit, max=max_limit)
